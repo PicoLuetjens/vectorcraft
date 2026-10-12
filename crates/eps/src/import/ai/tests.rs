@@ -5,7 +5,7 @@ use std::sync::Arc;
 use kurbo::{Point, Rect};
 use vectorcraft_color::gradient::GradientKind;
 use vectorcraft_color::{BlendMode, Color, Paint};
-use vectorcraft_doc::{ColorMode, Document, Knockout, LayerColor, LineCap, LineJoin, Node, NodeKind};
+use vectorcraft_doc::{AppearanceItem, ColorMode, Document, Knockout, LayerColor, LineCap, LineJoin, Node, NodeKind};
 
 use super::*;
 
@@ -132,6 +132,92 @@ fn paths_colours_and_strokes() {
     assert!(a[4].appearance.fill().is_none() && a[4].appearance.stroke().is_some());
 }
 
+/// `Xk` and `XK` are global process colours: a name, a tint and whether the colour is RGB, as
+/// `Xx` has them (#1025). They come in as global swatches that aren't inks, linked at their tint.
+#[test]
+fn global_process_colours_are_global_swatches_at_their_tint() {
+    let art_ = format!("0 0 0 1 (Black global) 0.4 0 Xk\n0 0 0 0 1 0.5 0 (Brand orange) 0 1 XK\n{}b\n", rect_path(0.0, 0.0, 10.0, 10.0));
+    let doc = read_ok(&layer(&art_)).doc;
+    let a = art(&doc);
+    let Paint::Solid { swatch, tint, color } = fill(&a[0]) else { panic!("{:?}", fill(&a[0])) };
+    assert_eq!(swatch.as_deref(), Some("Black global"));
+    assert!((tint - 0.6).abs() < 1e-6 && matches!(color, Color::Cmyk { k, .. } if (k - 0.6).abs() < 1e-6), "{tint} {color:?}");
+    let stroke = a[0].appearance.stroke().unwrap().paint.clone();
+    assert!(
+        matches!(&stroke, Paint::Solid { swatch: Some(s), tint, color } if s == "Brand orange" && *tint == 1.0 && *color == Color::rgb(1.0, 0.5, 0.0)),
+        "{stroke:?}"
+    );
+    for name in ["Black global", "Brand orange"] {
+        let sw = doc.swatch(name).unwrap();
+        assert!(sw.global && !sw.spot, "{sw:?}");
+    }
+    assert_eq!(doc.swatch("Black global").unwrap().paint.color(), Some(Color::cmyk(0.0, 0.0, 0.0, 1.0)), "the swatch is the full colour");
+}
+
+/// A pattern's definition (`%AI3_BeginPattern`): its name and tile (8 points square here, y up),
+/// then its art on `%_` lines (a group of the tile's unpainted box and a dot, a round-capped
+/// stroke of no length), `E`.
+const DOTS: &str = "%AI3_BeginPattern: (Dots)\n(Dots) 0 0 8 8\n%_0 A\n%_0 Xw\n%_0 Ae\n%_u\n%_0 O\n%_0 8 m\n%_8 8 L\n%_8 0 L\n%_0 0 L\n%_0 8 L\n%_n\n\
+                    %_0 R\n%_0 0 0 1 K\n%_1 J 0 j 2 w 4 M []0 d\n%_4 4 m\n%_4 4 L\n%_S\n%_U\n%_/ArtDictionary :\n%_;\n%_\n%_9 () XW\nE\n%AI3_EndPattern\n";
+
+/// Patterns are read into pattern swatches, and `p` fills with one (#1025): the art keeps its
+/// layers, the fill places the tiles by its matrix.
+#[test]
+fn patterns_are_pattern_swatches_and_fill_with_them() {
+    let sub = |name: &str, art: &str| format!("%AI5_BeginLayer\n1 1 1 1 0 0 1 0 79 128 255 0 50 0 Lb\n({name}) Ln\n{art}LB\n%AI5_EndLayer--\n");
+    let body = format!(
+        "{DOTS}%AI5_BeginLayer\n1 1 1 1 0 0 1 0 79 128 255 0 50 0 Lb\n(Ground) Ln\n{}{}LB\n%AI5_EndLayer--\n",
+        sub("Lawn", &format!("(Dots) 0 0 1 1 0 0 0 0 0 [1 0 0 1 0 0] p\n{}f\n", rect_path(10.0, 20.0, 70.0, 80.0))),
+        sub("Paving", &format!("(Dots) 10 20 2 2 0 0 0 0 0 [2 0 0 2 10 20] P\n{}S\n", rect_path(90.0, 20.0, 150.0, 80.0))),
+    );
+    let s = read_ok(&body);
+    let doc = &s.doc;
+    let ground = &doc.layers[0];
+    let subs: Vec<_> = ground.children().unwrap().iter().map(|l| l.name.clone().unwrap_or_default()).collect();
+    assert_eq!(subs, ["Lawn", "Paving"]);
+    let def = doc.pattern("Dots").unwrap();
+    assert_eq!(def.tile, Rect::new(0.0, -8.0, 8.0, 0.0), "the tile, y down");
+    assert_eq!(def.art.len(), 1, "the tile's group");
+    let tile_box = &def.art[0].children().unwrap()[0];
+    assert_eq!(tile_box.geometric_bounds(), Some(def.tile), "the tile's box is where the tile is");
+    assert_eq!(def.art[0].children().unwrap().len(), 2);
+    assert!(matches!(&doc.swatch("Dots").unwrap().paint, Paint::Pattern { pattern, .. } if pattern == "Dots"));
+    let lawn = &ground.children().unwrap()[0].children().unwrap()[0];
+    let Paint::Pattern { pattern, xf } = fill(lawn) else { panic!("{:?}", fill(lawn)) };
+    assert_eq!(pattern, "Dots");
+    // The tile's top left (0, 8) in art space is (0, 92) on the page (crop marks 100 high); a dot
+    // centre (4, 4) is at (4, 96).
+    assert_eq!(xf * Point::ZERO, Point::new(0.0, 92.0));
+    assert_eq!(xf * Point::new(4.0, 4.0), Point::new(4.0, 96.0));
+    // A stroke with it, scaled twice and moved by (10, 20): the tile's top left is at (10, 36) in
+    // art space.
+    let paving = &ground.children().unwrap()[1].children().unwrap()[0];
+    let Some(Paint::Pattern { xf, .. }) = paving.appearance.stroke().map(|st| st.paint.clone()) else { panic!() };
+    assert_eq!(xf * Point::ZERO, Point::new(10.0, 64.0));
+    assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+}
+
+/// A pattern whose definition it can't read whole isn't kept: a fill with it is something the file
+/// has that isn't read, where it shows. Its definition costs nothing else.
+#[test]
+fn a_pattern_it_cant_read_is_an_error_only_where_it_fills() {
+    let unread = "%AI3_BeginPattern: (Old)\n(Old) 0 0 8 8 [\n(0 O 0 R 0 g) @\n(\n0 0 m 8 8 L S\n) &\n] E\n%AI3_EndPattern\n\
+                  %AI3_BeginPattern: (Odd)\n(Odd) 0 0 8 8\n%_U\nE\n%AI3_EndPattern\n%AI3_BeginPattern: (Flat)\n(Flat) 0 0 8 0\n%_0 0 m\n%_8 0 L\n%_S\nE\n%AI3_EndPattern\n";
+    let s = read_ok(&format!("{unread}{}", layer(&(rect_path(0.0, 0.0, 1.0, 1.0) + "f\n"))));
+    assert!(s.doc.patterns.is_empty() && s.doc.swatches.iter().all(|w| !matches!(w.paint, Paint::Pattern { .. })));
+    for name in ["Old", "Odd", "Flat"] {
+        let e = read(
+            stream(&format!("{unread}{}", layer(&format!("({name}) 0 0 1 1 0 0 0 0 0 [1 0 0 1 0 0] p\n{}f\n", rect_path(0.0, 0.0, 1.0, 1.0)))))
+                .as_bytes(),
+        )
+        .unwrap_err();
+        assert!(e.contains("pattern fills"), "{name}: {e}");
+    }
+    // Type in a pattern isn't read either.
+    let typed = "%AI3_BeginPattern: (Words)\n(Words) 0 0 8 8\n%_/AI11Text :\n%_0 /StoryIndex ,\n%_;\nE\n%AI3_EndPattern\n";
+    assert!(read_ok(&format!("{typed}{}", layer(""))).doc.patterns.is_empty());
+}
+
 #[test]
 fn compound_paths_and_clipping() {
     let art_ = format!(
@@ -156,6 +242,25 @@ fn compound_paths_and_clipping() {
     let doc = read_ok(&layer(&format!("{}f\n{}W\nn\n", rect_path(0.0, 0.0, 9.0, 9.0), rect_path(0.0, 0.0, 5.0, 5.0)))).doc;
     let NodeKind::Layer { clip, children, .. } = &doc.layers[0].kind else { panic!() };
     assert!(*clip && matches!(children[0].kind, NodeKind::Path { clipping: true, .. }));
+}
+
+/// #1410: a compound path shows its last path's paint, and paths grouped in it stay its paths.
+#[test]
+fn compound_path_takes_its_last_paths_paint() {
+    let paths = format!("0 g\n{}f\n{RED}{}f\n", rect_path(0.0, 0.0, 30.0, 30.0), rect_path(10.0, 10.0, 20.0, 20.0));
+    let bodies = [
+        format!("0 Ae\n*u\n{paths}*U\n"),
+        // The paths in a group.
+        format!("0 Ae\n*u\n0 Ae\nu\n{paths}U\n*U\n"),
+        // The last path unpainted.
+        format!("*u\n{paths}{}n\n*U\n", rect_path(1.0, 1.0, 2.0, 2.0)),
+    ];
+    for body in bodies {
+        let a = art(&read_ok(&layer(&body)).doc);
+        let NodeKind::Compound { children, .. } = &a[0].kind else { panic!("{:?}", a[0].kind) };
+        assert!(children.len() >= 2 && children.iter().all(|c| matches!(c.kind, NodeKind::Path { .. })), "{body}");
+        assert_eq!(fill(&a[0]).color(), Some(Color::rgb(1.0, 0.0, 0.0)), "{body}");
+    }
 }
 
 #[test]
@@ -195,6 +300,23 @@ fn gradients() {
     assert_eq!((geom.start, geom.end), (Point::new(100.0, 50.0), Point::new(150.0, 50.0)));
     // The gradient was the one object's.
     assert_eq!(fill(&a[1]).color(), Some(Color::rgb(1.0, 0.0, 0.0)));
+    // A linear gradient with a stop in the middle: `Xm` places its whole ramp, a `Bm` each of its
+    // two parts. The object's own note of its gradient after it paints nothing.
+    let defs = "(L) 0 3 Bd\n%_1 0 50 100 Bs\n%_0.5 0 50 40 Bs\n%_0 0 50 0 Bs\nBD\n";
+    let art_ = format!(
+        "{RED}{}Bb\n1 (L) 0 0 -90 1 1 0 0 1 0 0 1 Bg\n0 -100 -100 0 150 100 Xm\n0 -9000 -100 0 150 9100 Bc\n0 -40 -100 0 150 100 Bm\n\
+         0 -60 -100 0 150 60 Bm\n0 -9000 -100 0 150 0 Bc\nf\n0 BB\n0 1 Xd\nBb\n2 (L) 0 0 -90 1 1 0 0 1 0 0 1 Bg\n0 BB\n6 () XW\n{}f\n",
+        rect_path(50.0, 0.0, 150.0, 100.0),
+        rect_path(0.0, 0.0, 10.0, 10.0),
+    );
+    let doc = read_ok(&format!("{defs}{}", layer(&art_))).doc;
+    let a = art(&doc);
+    let Paint::Gradient(g) = fill(&a[0]) else { panic!("{:?}", fill(&a[0])) };
+    assert_eq!(g.gradient.stops.len(), 3);
+    // Art space has y up from the crop marks' bottom.
+    let geom = g.geom.unwrap();
+    assert!(geom.start.distance(Point::new(150.0, 0.0)) < 1e-9 && geom.end.distance(Point::new(150.0, 100.0)) < 1e-9, "{geom:?}");
+    assert_eq!(fill(&a[1]).color(), Some(Color::rgb(1.0, 0.0, 0.0)), "the note after the object isn't the next path's paint");
 }
 
 #[test]
@@ -285,6 +407,81 @@ fn images_with_alpha_channels() {
     assert!(art(&r.doc).is_empty() && r.warnings.iter().any(|w| w.contains("cut short")));
 }
 
+/// Editing data with one layer (showing or not) holding a placed file: its matrix, the file at
+/// `path` in the box 10 20 14 22, and `preview` (what its preview section holds), then `after`.
+fn placed(visible: bool, matrix: &str, path: &str, preview: Option<&[u8]>, after: &str) -> Vec<u8> {
+    let text = stream(&layer("@@").replacen("1 1 1 1", if visible { "1 1 1 1" } else { "0 1 1 1" }, 1));
+    let (head, tail) = text.split_once("@@").unwrap();
+    let mut s = format!(
+        "{head}%AI5_BeginPlace\r%%FileType: 1\r{matrix} 10 20 14 22 4 4 0\r({path})`\r%%IncludeFile:{path}\r\
+         %AI17_Begin_Content_if_version_gt:24 12\r%AI28_BeginPlacedRelativePath\r()\r%AI28_EndPlacedRelativePath\r%AI17_Alternate_Content\r%AI17_End_Versioned_Content\r\
+         %AI17_Begin_Content_if_version_gt:24 5\r"
+    )
+    .into_bytes();
+    if let Some(p) = preview {
+        s.extend_from_slice(b"%AI26_BeginPlacedObjectPreview\r");
+        s.extend_from_slice(p);
+        s.extend_from_slice(b"\r%AI26_EndPlacedObjectPreview\r");
+    }
+    s.extend_from_slice(format!("%AI17_End_Versioned_Content\r~\r%AI5_EndPlace\r{after}{tail}").as_bytes());
+    s
+}
+
+#[test]
+fn placed_files_are_linked_images_showing_their_preview() {
+    // A 2×1 preview (premultiplied ARGB, a padded row) of a file of 4×2 pixels.
+    let preview = [&b"2 1 12 32 17 "[..], &[255, 255, 0, 0, 128, 0, 64, 0, 9, 9, 9, 9]].concat();
+    let name = "%_/ArtDictionary :\r%_(Photo) /String (AIArtName) ,\r%_;\r";
+    let r = read(&placed(true, "[5 0 0 -5 0 200]", "/pics/photo.png", Some(&preview), name)).unwrap();
+    let a = art(&r.doc);
+    let NodeKind::Image(im) = &a[0].kind else { panic!("{:?}", a[0].kind) };
+    assert_eq!((im.link.as_ref().map(|l| l.path.as_str()), im.width, im.height), (Some("/pics/photo.png"), 2, 1));
+    assert_eq!(a[0].name.as_deref(), Some("Photo"));
+    assert!(r.doc.images[&im.key].is_proxy(), "the preview is what a missing link shows");
+    let (img, xf) = pixels(&r.doc);
+    assert_eq!((img.get_pixel(0, 0).0, img.get_pixel(1, 0).0), ([255, 0, 0, 255], [0, 127, 0, 128]));
+    // Without a template box the pixels start at the box's corner, the first row the top one:
+    // (10, 20) is at (50, 100) in art space, the page's top.
+    assert_eq!((xf * Point::ZERO, xf * Point::new(2.0, 1.0)), (Point::new(50.0, 0.0), Point::new(70.0, 10.0)));
+    assert!(r.warnings.iter().any(|w| w.contains("low-resolution preview")), "{:?}", r.warnings);
+    // With a template box, the pixels start at the canvas point of art space's origin (8091.5,
+    // 8241.5 here), wherever the box is.
+    let mut data = placed(true, "[5 0 0 -5 -40407.5 41307.5]", "a.png", Some(&preview), "");
+    let at = data.windows(15).position(|w| w == b"%AI5_BeginLayer").unwrap();
+    data.splice(at..at, *b"%AI3_TemplateBox: 100 50 100 50\n");
+    let xf = pixels(&read(&data).unwrap().doc).1;
+    assert_eq!((xf * Point::ZERO, xf * Point::new(2.0, 1.0)), (Point::new(50.0, 0.0), Point::new(70.0, 10.0)));
+    // Turned a quarter: the box's rows run along x.
+    let r = read(&placed(true, "[0 5 5 0 0 0]", "a.png", Some(&preview), "")).unwrap();
+    let xf = pixels(&r.doc).1;
+    assert_eq!((xf * Point::ZERO, xf * Point::new(2.0, 1.0)), (Point::new(100.0, 50.0), Point::new(110.0, 30.0)));
+
+    // Without a preview it can read (none, cut short, not 32 bits, absurd sizes), without a path or
+    // a matrix, the file isn't read from its editing data.
+    let cut = &preview[..preview.len() - 6];
+    let huge = b"70000 70000 280000 32 17 \0\0\0\0";
+    let overflow = b"1 2 18446744073709551615 32 17 \0\0\0\0\0\0\0\0";
+    for (matrix, path, preview) in [
+        ("[5 0 0 -5 0 200]", "a.png", None),
+        ("[5 0 0 -5 0 200]", "a.png", Some(cut)),
+        ("[5 0 0 -5 0 200]", "a.png", Some(&b"2 1 2 8 17 \0\0"[..])),
+        ("[5 0 0 -5 0 200]", "a.png", Some(&huge[..])),
+        ("[5 0 0 -5 0 200]", "a.png", Some(&overflow[..])),
+        ("[5 0 0 -5 0 200]", "a.png", Some(&b"2 1"[..])),
+        ("[5 0 0 -5 0 200]", "", Some(&preview[..])),
+        ("[0 0 0 0 0 0]", "a.png", Some(&preview[..])),
+        ("[1 2 3]", "a.png", Some(&preview[..])),
+    ] {
+        let e = read(&placed(true, matrix, path, preview, "")).unwrap_err();
+        assert!(e.contains("placed files"), "{matrix} {path} {preview:?}: {e}");
+    }
+    // On a layer that doesn't show, such a file is left out of it.
+    let r = read(&placed(false, "[5 0 0 -5 0 200]", "a.png", None, "")).unwrap();
+    assert!(r.hidden_unread.contains("placed files") && art(&r.doc).is_empty());
+    // `~` ends nothing else.
+    assert!(read(stream(&layer("~\n")).as_bytes()).unwrap_err().contains("`~`"));
+}
+
 #[test]
 fn text_objects_are_slots_named_after_their_story() {
     let words = "/AI11Text :\n0 /FreeUndo ,\n0 /FrameIndex ,\n3 /StoryIndex ,\n;\n%_/ArtDictionary :\n%_/XMLUID : (Title) ; (AI10_ArtUID) ,\n%_;\n";
@@ -298,6 +495,20 @@ fn text_objects_are_slots_named_after_their_story() {
     let r = read_ok(&layer(&format!("/AI11Text :\n0 /StoryIndex ,\n;\n{}{}", commented(0), commented(1))));
     let stories: Vec<_> = art(&r.doc).iter().map(|n| slot_of(n.name.as_deref())).collect();
     assert_eq!(stories, [Some(Some(0)), Some(Some(1))]);
+    // A text object with an appearance: its drawn look (a group whose type is a story of the
+    // undo-free text document, which counts its own), then the object on `%_` lines, which is
+    // the type.
+    let look = "0 Ae\nu\n/AI11Text :\n1 /FreeUndo ,\n0 /FrameIndex ,\n0 /StoryIndex ,\n;\nU\n0 0 Xd\n6 () XW\n";
+    let own: String = "/AI11Text :\n0 /FreeUndo ,\n0 /FrameIndex ,\n7 /StoryIndex ,\n;\n".lines().map(|l| format!("%_{l}\n")).collect();
+    let plain = "/AI11Text :\n0 /FreeUndo ,\n0 /FrameIndex ,\n0 /StoryIndex ,\n;\n";
+    let r = read_ok(&layer(&format!("{look}{own}1 (Style) XW\n{plain}")));
+    let stories: Vec<_> = art(&r.doc).iter().map(|n| slot_of(n.name.as_deref())).collect();
+    assert_eq!(stories, [Some(Some(7)), Some(Some(0))], "the look's story 0 isn't the text document's");
+    // What else the look draws stays, under the type.
+    let look = look.replace("U\n", &format!("{RED}{}f\nU\n", rect_path(0.0, 0.0, 10.0, 10.0)));
+    let r = read_ok(&layer(&format!("{look}{own}1 (Style) XW\n")));
+    let a = art(&r.doc);
+    assert_eq!((a.len(), a[0].children().map(Vec::len), slot_of(a[1].name.as_deref())), (2, Some(1), Some(Some(7))));
 }
 
 #[test]
@@ -332,13 +543,102 @@ fn sections_it_skips() {
 /// Non-native art (a placed PDF's content) keeps its PDF as ASCII85 in comment lines after
 /// `/Data ,`. ASCII85 has `_`, so a line may start with `%_`, which otherwise reads as hidden
 /// tokens, and a `(` in it would swallow the rest of the layer (a letterhead saved by Illustrator
-/// 28 wouldn't open: "it ends inside a layer"). The art is left out with a note.
+/// 28 wouldn't open: "it ends inside a layer"). Data that isn't a PDF is left out with a note.
 #[test]
-fn non_native_art_is_skipped_with_its_ascii85_data() {
-    let foreign = "/ForeignObject :\n1 /Version ,\n2 0 0 2 10 20  /RTransform ,\n/Data ,\n%,u@!!/MSk8%41#ocdN=10d&\n%_O%*mGn(RduU.]4`[u[.f\n%_;(]<[%\n%1H@<P2`V<S,pbuU7L]\\~>\n;\n0 0 Xd\n6 () XW\n0 Ae\n";
+fn non_native_art_that_is_not_a_pdf_is_left_out_with_a_note() {
+    let foreign = "/ForeignObject :\n1 /Version ,\n2 0 0 2 10 20  /RTransform ,\n10 20  /Origin ,\n1 2 5 8  /Bounds ,\n/Data ,\n%,u@!!/MSk8%41#ocdN=10d&\n%_O%*mGn(RduU.]4`[u[.f\n%_;(]<[%\n%1H@<P2`V<S,pbuU7L]\\~>\n;\n0 0 Xd\n6 () XW\n0 Ae\n";
     let s = read_ok(&layer(&format!("{foreign}{}", rect_path(0.0, 0.0, 1.0, 1.0) + "f\n")));
     assert_eq!(art(&s.doc).len(), 1);
-    assert!(s.warnings.iter().any(|w| w == read::NON_NATIVE_ART), "{:?}", s.warnings);
+    assert!(s.warnings.iter().any(|w| w.starts_with(read::NON_NATIVE_ART_UNREAD)), "{:?}", s.warnings);
+}
+
+/// A PDF with one page of `size` points holding `content`.
+fn tiny_pdf(size: f64, content: &str) -> Vec<u8> {
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {size} {size}] /Contents 4 0 R >>"),
+        format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len() + 1),
+    ];
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![];
+    for (i, o) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n{o}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes());
+    for o in offsets {
+        pdf.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objects.len() + 1).as_bytes());
+    pdf
+}
+
+/// `bytes` as ASCII85 in comment lines of 60 characters, ending with `~>`.
+fn ascii85_comment_lines(bytes: &[u8]) -> String {
+    let mut text = String::new();
+    for chunk in bytes.chunks(4) {
+        let mut word = [0u8; 4];
+        word[..chunk.len()].copy_from_slice(chunk);
+        let mut v = u32::from_be_bytes(word);
+        let mut digits = [0u8; 5];
+        for d in digits.iter_mut().rev() {
+            *d = (v % 85) as u8 + b'!';
+            v /= 85;
+        }
+        text.extend(digits.iter().take(chunk.len() + 1).map(|d| char::from(*d)));
+    }
+    let mut lines = String::new();
+    for line in text.as_bytes().chunks(60) {
+        lines.push('%');
+        lines.push_str(std::str::from_utf8(line).unwrap());
+        lines.push('\n');
+    }
+    lines.push_str("%~>\n");
+    lines
+}
+
+/// The PDF of non-native art is drawn by the PDF importer, its art fitted to the object's box:
+/// `/Bounds` in a space measured from `/Origin` with y down, then `/RTransform`. Two squares at
+/// 1..5 × 2..8 of a 10-point page, blue below red: bounds (1, 2)–(5, 8) → from the origin
+/// (10, 20), y down, (11, 18)–(15, 12) → twice that plus (100, 50): x 122..130, y 74..86 in art
+/// space, which is y 14..26 in the document (crop marks 100 high). The space has y down, so the
+/// PDF's bottom (blue) is the top of the box.
+#[test]
+fn non_native_art_is_drawn_from_its_pdf_fitted_to_its_bounds() {
+    let pdf = tiny_pdf(10.0, "0 0 1 rg 1 2 4 3 re f 1 0 0 rg 1 5 4 3 re f");
+    let foreign = format!(
+        "q\n/ForeignObject :\n1 /Version ,\n2 0 0 2 100 50  /RTransform ,\n10 20  /Origin ,\n1 2 5 8  /Bounds ,\n/Data ,\n{};\n0 0 Xd\n6 () XW\n0 Ae\n{}h\nW\nn\nQ\n",
+        ascii85_comment_lines(&pdf),
+        rect_path(120.0, 70.0, 130.0, 90.0)
+    );
+    let s = read_ok(&layer(&foreign));
+    assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+    let objects = art(&s.doc);
+    assert_eq!(objects.len(), 1, "{objects:?}");
+    // A clipping group: the clip path first, then the non-native art's group.
+    let NodeKind::Group { children, clip: true } = &objects[0].kind else { panic!("{:?}", objects[0].kind) };
+    assert_eq!(children.len(), 2);
+    let group = &children[1];
+    assert_eq!(group.name.as_deref(), Some(read::NON_NATIVE_ART));
+    let bounds = group.geometric_bounds().unwrap();
+    for (got, want) in [(bounds.x0, 122.0), (bounds.y0, 14.0), (bounds.x1, 130.0), (bounds.y1, 26.0)] {
+        assert!((got - want).abs() < 1e-6, "{bounds:?}");
+    }
+    let paths = group.children().unwrap();
+    assert_eq!(paths.len(), 2);
+    let fill =
+        |n: &Node| n.appearance.items.iter().find_map(|it| if let AppearanceItem::Fill(f) = it { Some(f.paint.clone()) } else { None }).unwrap();
+    let (blue, red) = (fill(&paths[0]), fill(&paths[1]));
+    assert!(matches!(&blue, Paint::Solid { color, swatch: None, .. } if color.to_rgba8(1.0) == [0, 0, 255, 255]), "{blue:?}");
+    assert!(matches!(&red, Paint::Solid { color, swatch: None, .. } if color.to_rgba8(1.0) == [255, 0, 0, 255]), "{red:?}");
+    let (b, r) = (paths[0].geometric_bounds().unwrap(), paths[1].geometric_bounds().unwrap());
+    assert!((b.y0 - 14.0).abs() < 1e-6 && (b.y1 - 20.0).abs() < 1e-6, "blue {b:?}");
+    assert!((r.y0 - 20.0).abs() < 1e-6 && (r.y1 - 26.0).abs() < 1e-6, "red {r:?}");
+    // Its ids are this document's.
+    assert_ne!(group.id, paths[0].id);
+    assert_ne!(paths[0].id, paths[1].id);
 }
 
 #[test]

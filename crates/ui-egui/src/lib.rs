@@ -24,6 +24,7 @@ pub mod credits;
 pub mod cursors;
 pub mod dialogs;
 pub mod dock;
+mod edit_toolbar;
 pub mod find_font;
 pub mod floating;
 pub mod font_menu;
@@ -35,7 +36,9 @@ pub mod icons;
 pub mod io;
 pub mod menus;
 pub mod native_menu;
+pub mod opening;
 pub mod palette;
+mod panel_docking;
 pub mod panels;
 pub mod picks;
 pub mod place;
@@ -49,6 +52,7 @@ pub mod shortcuts;
 pub mod state;
 pub mod sysclip;
 pub mod theme;
+pub mod thumb_worker;
 pub mod titlebar;
 pub mod toolbar;
 mod touch;
@@ -117,6 +121,8 @@ mod tests_recolor;
 mod tests_recovery;
 #[cfg(test)]
 mod tests_removeanchors;
+#[cfg(test)]
+mod tests_ruler_origin;
 #[cfg(test)]
 mod tests_save;
 #[cfg(test)]
@@ -228,6 +234,10 @@ pub struct Services {
     /// Write a file from any thread (desktop): lets Background Save and Export write off the UI
     /// thread ([`background`]). Without it they run at once.
     pub write_shared: Option<background::SharedWriteFn>,
+    /// Write a file from any thread with what a filler writes into it (desktop): native saves
+    /// stream into the file as they are encoded instead of being held whole in memory first.
+    /// Without it they are encoded, then written with `write` / `write_shared`.
+    pub stream_shared: Option<background::SharedStreamFn>,
     /// Open a file (or a folder) in the system's default app for it (desktop: Edit Original, Show
     /// Package). Without it (the web) those answer with an error.
     pub open_file: Option<RevealFn>,
@@ -242,9 +252,13 @@ pub struct Services {
     /// The macOS menu bar, when the desktop app installed one: the in-window menus are hidden then.
     pub native_menu: Option<native_menu::NativeMenu>,
     /// Show file dialogs off the UI thread (desktop Linux, where a dialog in line holds the window
-    /// and the compositor finds it not answering): what asked runs again with the answer
-    /// ([`picks`]). Without it they are shown in line.
+    /// and the compositor finds it not answering, #592) or as sheets on the window (macOS, where a
+    /// dialog in line aborts the app, #867): what asked runs again with the answer ([`picks`]).
+    /// Without it they are shown in line.
     pub start_pick: Option<picks::StartPick>,
+    /// [`Self::start_pick`]'s dialogs are sheets on the window (macOS): while one is open the app
+    /// neither quits nor closes documents, as under the modal dialog before.
+    pub dialogs_are_sheets: bool,
 }
 
 /// Cached canvas raster.
@@ -253,6 +267,10 @@ pub struct CanvasCache {
     pub texture: Option<egui::TextureHandle>,
     pub key: Option<CacheKey>,
     pub last_ms: f64,
+    /// The frame shown drew raster effects from rasters made before their objects moved
+    /// ([`vectorcraft_render::FrameStats::moved`]): the next frame outside an interaction runs
+    /// them again, on the worker when there is one.
+    pub moved: bool,
     pub worker: Option<render_worker::Worker>,
     pub worker_started: bool,
     /// The slices as laid out for (document uid, revision): the canvas draws them every frame.
@@ -277,6 +295,8 @@ pub type PrintTilingCache = ((u64, u64), std::sync::Arc<Vec<vectorcraft_pdf::Til
 pub struct CacheKey {
     pub doc: usize,
     pub revision: u64,
+    /// An interaction is in progress ([`vectorcraft_render::RenderOptions::interacting`]).
+    pub interacting: bool,
     pub zoom: f64,
     pub cx: f64,
     pub cy: f64,
@@ -298,6 +318,9 @@ pub struct CacheKey {
     pub smooth_images: bool,
     /// Isolation mode's group or layer ([`vectorcraft_render::RenderOptions::isolated`]).
     pub isolated: Option<u64>,
+    /// Appearance of Black › On Screen › Display All Blacks as Rich Black
+    /// ([`vectorcraft_render::RenderOptions::rich_black`]).
+    pub rich_black: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -314,8 +337,9 @@ pub struct VectorcraftApp {
     pub services: Services,
     pub canvas: CanvasCache,
     pub perf: Perf,
-    /// macOS: draw our own title strip under the traffic lights.
-    pub integrated_titlebar: bool,
+    /// macOS: the room the app bar keeps at its left for the window buttons over it, in points
+    /// (0 where the OS draws no buttons over the app bar).
+    pub titlebar_inset: f32,
     /// Last applied effect (Effect → Apply Last Effect).
     pub last_effect: Option<(String, serde_json::Value)>,
     /// Commands run through [`Self::run`] so far: the native menu bar reads its rows again when it
@@ -352,6 +376,9 @@ pub struct VectorcraftApp {
     /// Windows and Linux: the window has no OS decorations, so the app bar is the title bar (drag,
     /// double-click to maximize, caption buttons) and invisible edge zones resize the window.
     pub custom_titlebar: bool,
+    /// Last window title sent to the OS (`ViewportCommand::Title`, see `chrome::sync_window_title`):
+    /// sent again only when it changes, so idle frames don't spam the backend.
+    pub(crate) last_window_title: String,
     /// The graphics adapter the window renders with ("name (backend)"), as the host reports it:
     /// shown in Help › About and `ui.inspect` for GPU bug reports. `None` when unknown.
     pub graphics_adapter: Option<String>,
@@ -371,16 +398,12 @@ pub struct VectorcraftApp {
     /// The look for fonts installed or removed while the app was in the background, running
     /// ([`Self::refresh_installed_fonts`]): whether they were.
     font_check: Option<std::sync::mpsc::Receiver<bool>>,
-    /// The window came back to the front: check the active document's linked files next frame
-    /// ([`dialogs::missing_links::after_focus`]).
-    pub(crate) links_check: bool,
-    /// The changed linked files already offered for update (path, size and modification time), so
-    /// coming back to the window doesn't ask about the same change twice.
-    pub(crate) links_asked: std::collections::HashSet<dialogs::missing_links::FileStamp>,
     /// Keyboard pastes of something other than text (see [`shortcuts::PasteChord`]).
     pub(crate) paste_chord: shortcuts::PasteChord,
     /// Saves and exports running in the background (Preferences → File Handling).
     pub background: background::Background,
+    /// Documents being read off the UI thread ([`opening`]).
+    pub opening: opening::Opening,
     /// Data Recovery's timer and startup question ([`recovery`]).
     pub recovery: recovery::Timer,
     /// Modifiers the keyboard holds (from the host's input), given back after synthetic input.
@@ -437,6 +460,7 @@ impl VectorcraftApp {
                 texture: None,
                 key: None,
                 last_ms: 0.0,
+                moved: false,
                 worker: None,
                 worker_started: false,
                 slices: None,
@@ -446,7 +470,7 @@ impl VectorcraftApp {
                 cursors: Default::default(),
             },
             perf: Perf::default(),
-            integrated_titlebar: false,
+            titlebar_inset: 0.0,
             last_effect: None,
             run_count: 0,
             clipboard_out: None,
@@ -467,6 +491,7 @@ impl VectorcraftApp {
             canvas_rect: None,
             hover_doc: None,
             custom_titlebar: false,
+            last_window_title: String::new(),
             graphics_adapter: None,
             place: Default::default(),
             system_paste: false,
@@ -474,10 +499,9 @@ impl VectorcraftApp {
             clipboard_probe: None,
             picks: picks::Picks::default(),
             font_check: None,
-            links_check: false,
-            links_asked: Default::default(),
             paste_chord: Default::default(),
             background: Default::default(),
+            opening: Default::default(),
             recovery: Default::default(),
             host_modifiers: Default::default(),
             synthetic_modifiers: false,
@@ -512,6 +536,11 @@ impl VectorcraftApp {
         if let Some(write) = s.write_shared.take() {
             s.write_shared = Some(Arc::new(move |p: &str, b: &[u8]| file_access::check_write(p).and_then(|()| write(p, b))));
         }
+        if let Some(stream) = s.stream_shared.take() {
+            s.stream_shared = Some(Arc::new(move |p: &str, fill: &mut dyn FnMut(&mut dyn std::io::Write) -> std::io::Result<()>| {
+                file_access::check_write(p).and_then(|()| stream(p, fill))
+            }));
+        }
         // Edit Original and Show in Folder hand a file to another app: only one automation may read.
         for service in [&mut s.open_file, &mut s.reveal] {
             if let Some(mut open) = service.take() {
@@ -530,6 +559,17 @@ impl VectorcraftApp {
 
     pub fn view(&self) -> Option<&View> {
         self.session.active_index().and_then(|i| self.views.get(i))
+    }
+
+    /// The zero point shown by rulers and position fields; command coordinates stay absolute.
+    pub(crate) fn ruler_origin(&self) -> vectorcraft_geom::Point {
+        let origin = self.session.active().map_or(vectorcraft_geom::Point::ZERO, |d| d.doc.ruler_origin);
+        // An untrusted file cannot make the ruler's tick loop or position fields overflow.
+        if origin.is_finite() && origin.x.abs() <= vectorcraft_engine::MAX_COORD && origin.y.abs() <= vectorcraft_engine::MAX_COORD {
+            origin
+        } else {
+            vectorcraft_geom::Point::ZERO
+        }
     }
     pub fn view_mut(&mut self) -> Option<&mut View> {
         self.sync_views();
@@ -582,6 +622,16 @@ impl VectorcraftApp {
             return r;
         }
         let mut params = params;
+        // Paste in place, in front, in back (#693), Select › All on Active Artboard (#1006) and Align to
+        // Artboard: onto, on or to the active artboard, the view's. A batch passes it on to those steps.
+        if (vectorcraft_engine::ON_ACTIVE_ARTBOARD.contains(&id) || id == "command.batch")
+            && params.get("artboard").is_none()
+            && self.view().is_some()
+            && let Some(n) = self.session.active().map(|d| d.doc.artboards.len())
+            && let Some(p) = params.as_object_mut()
+        {
+            p.insert("artboard".into(), serde_json::json!(panels::artboards::selected(self, n)));
+        }
         if id.starts_with("edit.paste") {
             if let Err(e) = self.adopt_system_clipboard() {
                 self.ui.status = e.clone();
@@ -594,14 +644,6 @@ impl VectorcraftApp {
                 && let Some(p) = params.as_object_mut()
             {
                 p.insert("center".into(), serde_json::json!([c.x, c.y]));
-            }
-            // In place, in front, in back: onto the active artboard (#693).
-            if matches!(id, "edit.pasteInPlace" | "edit.pasteInFront" | "edit.pasteInBack")
-                && params.get("artboard").is_none()
-                && let Some(i) = self.view().map(|v| v.artboard)
-                && let Some(p) = params.as_object_mut()
-            {
-                p.insert("artboard".into(), serde_json::json!(i));
             }
             if let Some(r) = dialogs::swatch_conflict::ask(self, id, &params) {
                 return r;
@@ -661,8 +703,16 @@ impl VectorcraftApp {
     /// Select a tool (also used by the toolbar and shortcuts).
     pub fn select_tool(&mut self, id: &str) {
         let v = self.view_info();
+        let before = self.session.tool_id();
         if let Err(e) = self.session.select_tool(id, v) {
             self.ui.status = e.to_string();
+        }
+        // A newly chosen Artboard tool starts on the active artboard (the view's).
+        if before != "artboard"
+            && self.session.tool_id() == "artboard"
+            && let Some(n) = self.session.active().map(|d| d.doc.artboards.len())
+        {
+            panels::artboards::select(self, panels::artboards::selected(self, n));
         }
         if let Some(g) = vectorcraft_tools::catalog::group_of(id)
             && let Some(slot) = self.ui.group_tool.get_mut(g)
@@ -679,8 +729,13 @@ impl VectorcraftApp {
             let reply = req.reply.clone();
             // Guarded per request: a panic must not drop the channel (taken out of `self` above).
             let roots = self.automation_roots.clone();
-            let outcome = file_access::confine(roots.as_ref(), || vectorcraft_engine::guard::catch_panic(|| control::handle(self, ctx, &req)))
-                .unwrap_or_else(|msg| control::err(format!("internal error: {msg} (please report this bug)")));
+            let outcome = match file_access::confine(roots.as_ref(), || vectorcraft_engine::guard::catch_panic(|| control::handle(self, ctx, &req))) {
+                Ok(outcome) => outcome,
+                Err(msg) => {
+                    self.picks.recover();
+                    control::err(format!("internal error: {msg} (please report this bug)"))
+                }
+            };
             match outcome {
                 control::Outcome::Done(v) => {
                     let _ = reply.send(v);
@@ -755,6 +810,77 @@ impl VectorcraftApp {
     /// keeps the marked text and types it again into the next composition: the host discards it.
     pub fn take_ime_discard(&mut self) -> bool {
         std::mem::take(&mut self.ime_discard)
+    }
+
+    /// Linked files another app changed while their document is open: every two seconds, and as
+    /// soon as the window comes back to the front, stamp the active document's linked files on a
+    /// worker thread and act on the changed ones as Preferences › File Handling › Update Links
+    /// says ([`vectorcraft_engine::link_watch`]). No look starts while a dialog is open, so an
+    /// Ask When Modified question never goes unseen.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn tick_link_updates(&mut self, ctx: &egui::Context, now: f64) {
+        if let Some(r) = self.session.poll_link_scan() {
+            match r {
+                Ok(r) => {
+                    let n = |k: &str| r[k].as_array().map_or(0, Vec::len);
+                    if n("updated") > 0 {
+                        self.status(format!("Updated {} linked file(s) changed on disk", n("updated")));
+                    }
+                    if n("ask") > 0 {
+                        dialogs::missing_links::ask_update_changed(self, r["ask"].as_array().cloned().unwrap_or_default());
+                    }
+                    if n("modified") > 0 {
+                        self.status(format!("{} linked image(s) changed on disk: Update Links shows the new versions", n("modified")));
+                    }
+                }
+                Err(e) => self.status(e.to_string()),
+            }
+        }
+        let (last_key, focus_key) = (egui::Id::new("linkWatch.lastScan"), egui::Id::new("linkWatch.focused"));
+        let focused = ctx.input(|i| i.focused);
+        let was_focused: bool = ctx.data(|d| d.get_temp(focus_key)).unwrap_or(focused);
+        ctx.data_mut(|d| d.insert_temp(focus_key, focused));
+        if self.ui.dialog.is_some() || self.session.active().is_none() {
+            return;
+        }
+        let last: f64 = ctx.data(|d| d.get_temp(last_key)).unwrap_or(f64::NEG_INFINITY);
+        // The active document as the last look saw it: its uid and revision.
+        let (seen_key, doc) = (egui::Id::new("linkWatch.seen"), self.session.active().map(|d| (d.uid, d.revision)));
+        if now - last >= 2.0 || (focused && !was_focused) {
+            // Walking the document's links costs a pass over it: only when a look is due.
+            // `start_link_scan` starts none for a document without links, which then doesn't
+            // wake the app for looks of its own (any frame still looks once one is due).
+            ctx.data_mut(|d| d.insert_temp(last_key, now));
+            self.session.start_link_scan();
+            let links = self.session.link_scan.is_some();
+            ctx.data_mut(|d| {
+                d.insert_temp(egui::Id::new("linkWatch.links"), links);
+                d.insert_temp(seen_key, doc);
+            });
+        }
+        if self.session.link_scan.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        } else if ctx.data(|d| d.get_temp::<bool>(egui::Id::new("linkWatch.links"))).unwrap_or(false) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(2000));
+        } else if ctx.data(|d| d.get_temp::<Option<(u64, u64)>>(seen_key)).is_some_and(|seen| seen != doc) {
+            // The document changed (a file placed into one without links) or another came to the
+            // front since that look: wake for the next one even if the app sits idle until then,
+            // or a file placed and changed meanwhile is first seen after the change, which is then
+            // never acted on.
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64((last + 2.0 - now).clamp(0.0, 2.0)));
+        }
+    }
+
+    /// A file dialog is open off the UI thread (a sheet on macOS, [`picks`]): what asked for it runs
+    /// again when it answers.
+    pub fn file_dialog_open(&self) -> bool {
+        self.picks.is_waiting()
+    }
+
+    /// A file dialog is open as a sheet on the window ([`Services::dialogs_are_sheets`]): nothing
+    /// closes or quits until it answers.
+    pub fn file_sheet_open(&self) -> bool {
+        self.services.dialogs_are_sheets && self.file_dialog_open()
     }
 
     /// Show a transient status message.
@@ -845,6 +971,7 @@ impl VectorcraftApp {
     pub fn logic(&mut self, ctx: &egui::Context) {
         let confined = self.synthetic_frame.then(|| self.automation_roots.clone()).flatten();
         if let Err(msg) = file_access::confine(confined.as_ref(), || vectorcraft_engine::guard::catch_panic(|| self.logic_frame(ctx))) {
+            self.picks.recover();
             self.status(format!("Internal error: {msg} (please report this bug)"));
         }
     }
@@ -889,20 +1016,24 @@ impl VectorcraftApp {
             self.system_paste = wanted && self.system_clipboard_pasteable();
         }
         self.poll_font_check(ctx);
-        if std::mem::take(&mut self.links_check) {
-            dialogs::missing_links::after_focus(self);
-        }
         picks::poll(self, ctx);
         background::poll(self);
-        if !self.background.jobs.is_empty() {
+        opening::poll(self);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.tick_link_updates(ctx, now);
+        if !self.background.jobs.is_empty() || !self.opening.pending.is_empty() {
             // Keep the status bar's progress moving and pick the result up when it arrives.
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         // The window's close button (or the system quitting the app) asks about unsaved documents,
-        // once the saves running in the background are done.
+        // once the saves running in the background are done. Not while a file dialog's sheet is on
+        // the window: what asked for it runs again when it answers.
         if ctx.input(|i| i.viewport().close_requested()) {
             background::wait_all(self);
-            if unsaved::any_dirty(self) {
+            if self.file_sheet_open() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.status(picks::busy());
+            } else if unsaved::any_dirty(self) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 if let Err(e) = unsaved::close_all(self, "quit") {
                     self.status(e);
@@ -918,6 +1049,9 @@ impl VectorcraftApp {
         }
         shortcut_editor::sync(&self.ui);
         prefs_dialog::apply_runtime(self, ctx);
+        // The OS title bar (and the taskbar / Alt-Tab entry) follows the active file; with the
+        // system title bar this is where the document name lives, as the in-app mark is hidden.
+        crate::chrome::sync_window_title(self, ctx);
         self.drain_control(ctx);
         if !self.synthetic.is_empty() {
             ctx.request_repaint();
@@ -940,8 +1074,8 @@ impl VectorcraftApp {
         self.take_dropped_files(ctx);
     }
 
-    /// Files dropped on the window: documents opened, pictures and text placed on the canvas
-    /// ([`Self::drop_target`]).
+    /// Files dropped on the window: documents, libraries, presets and plug-ins opened, pictures
+    /// and text placed on the canvas ([`Self::drop_target`]).
     #[cfg(not(target_arch = "wasm32"))]
     fn take_dropped_files(&mut self, ctx: &egui::Context) {
         let (dropped, shift) = ctx.input(|i| (i.raw.dropped_files.clone(), i.modifiers.shift));
@@ -1017,7 +1151,9 @@ impl VectorcraftApp {
         // The native menu's key equivalents become the input their keys make, ahead of what came
         // after them (see `native_menu`).
         let keys = self.services.native_menu.as_mut().map(native_menu::NativeMenu::take_keys).unwrap_or_default();
-        if !keys.is_empty() {
+        // The menu bar does nothing while a file dialog is open (`native_menu`): a key that raced it
+        // going inert is dropped.
+        if !keys.is_empty() && !self.file_dialog_open() {
             let events: Vec<egui::Event> = keys.into_iter().flat_map(|k| native_menu::key_events(k, || self.system_clipboard_text())).collect();
             raw.events.splice(0..0, events);
         }
@@ -1025,10 +1161,7 @@ impl VectorcraftApp {
             match e {
                 egui::Event::ModifiersChanged(m) => self.host_modifiers = *m,
                 egui::Event::WindowFocused(false) => self.host_modifiers = egui::Modifiers::NONE,
-                egui::Event::WindowFocused(true) => {
-                    self.refresh_installed_fonts();
-                    self.links_check = true;
-                }
+                egui::Event::WindowFocused(true) => self.refresh_installed_fonts(),
                 _ => {}
             }
         }
@@ -1077,6 +1210,7 @@ impl VectorcraftApp {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let confined = self.synthetic_frame.then(|| self.automation_roots.clone()).flatten();
         if let Err(msg) = file_access::confine(confined.as_ref(), || vectorcraft_engine::guard::catch_panic(|| self.ui_frame(ui))) {
+            self.picks.recover();
             self.status(format!("Internal error: {msg} (please report this bug)"));
         }
     }
