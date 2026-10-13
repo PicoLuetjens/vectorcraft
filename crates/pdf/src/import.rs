@@ -26,6 +26,8 @@ use crate::import_shading::{clipped, extend_clip, fold_stop_opacity, gradient_sh
 use crate::import_text::{Families, LineFacts, Look, Placement, TextLine, Upright};
 use crate::{CropTo, ImportOptions, ImportReport, PdfError, TextAs};
 
+/// Mixed into an image's cache key when it is read white inside an alpha soft mask.
+const WHITE_KEY: u128 = 0x7717_e000_a1fa;
 /// The name of the paths text imports as.
 const TEXT_OUTLINES: &str = "<Text Outlines>";
 /// A page whose overprint (ISO 32000-1 §8.6.7) is left out rather than given to the wrong objects.
@@ -788,6 +790,10 @@ struct Builder<'p> {
     /// A transparency group was just pushed: a form's (whose flags come next) or an image's.
     pending: bool,
     nested: u32,
+    /// Reading an alpha soft mask's art: images are read white with their own alpha, so the
+    /// mask's luminance is their alpha, as whitened vector art's is (cairo, and so Inkscape,
+    /// rasterizes masks into such images).
+    white_images: bool,
     /// The last filled path: its node and its outline (a stroke of the same outline joins it).
     last_fill: Option<(NodeId, BezPath)>,
     /// What each line of type made tells beyond its text object ([`crate::import_lines`]).
@@ -930,6 +936,7 @@ impl<'p> Builder<'p> {
             marked: vec![],
             pending: false,
             nested: 0,
+            white_images: false,
             last_fill: None,
             lines: HashMap::new(),
         }
@@ -1234,11 +1241,50 @@ impl<'p> Builder<'p> {
     }
 
     fn flush_text(&mut self) {
-        let Some((t, opacity, facts)) = self.text.take().and_then(TextLine::finish) else { return };
-        let mut n = Node::new(self.id(), NodeKind::Text(Box::new(t)));
-        n.opacity = opacity;
-        self.lines.insert(n.id, facts);
-        self.push_node(n);
+        let Some(mut line) = self.text.take() else { return };
+        let held = std::mem::take(&mut line.held);
+        if let Some((t, opacity, facts)) = line.finish() {
+            let mut n = Node::new(self.id(), NodeKind::Text(Box::new(t)));
+            n.opacity = opacity;
+            self.lines.insert(n.id, facts);
+            self.push_node(n);
+        }
+        // The strokes of its glyphs' outlines, right after it ([`import_lines`] makes them its stroke).
+        for n in held {
+            self.push_node(n);
+        }
+    }
+
+    /// A stroke of the outline of the glyph just drawn, in the glyph's own paint, while every glyph
+    /// before it on the open line was stroked so too, is held with the line instead of ending it
+    /// (an editor writes type on a path glyph by glyph, each followed by the stroke added to the
+    /// type). `false`: it isn't one.
+    fn hold_glyph_stroke(&mut self, path: &BezPath, transform: Affine, paint: &hayro_interpret::Paint<'_>, draw_mode: &PathDrawMode) -> bool {
+        let PathDrawMode::Stroke(props) = draw_mode else { return false };
+        if self.mask.is_some() || self.blend != BlendMode::Normal || matches!(paint, hayro_interpret::Paint::Pattern(_)) {
+            return false;
+        }
+        let (p, opacity) = self.paint(paint, true);
+        let Some(line) = &self.text else { return false };
+        let Some(ink) = line.ink.last() else { return false };
+        if line.held.len() + 1 != line.ink.len() || opacity < 0.999 || !line.last_fill().is_some_and(|f| *f == p) {
+            return false;
+        }
+        let mut bp = path.clone();
+        bp.apply_affine(transform);
+        let b = bp.bounding_box();
+        let tol = 0.01 * (ink.width() + ink.height()) + 0.01;
+        if ![(b.x0, ink.x0), (b.y0, ink.y0), (b.x1, ink.x1), (b.y1, ink.y1)].iter().all(|(a, c)| (a - c).abs() <= tol) {
+            return false;
+        }
+        let mut st = stroke_layer(p, opacity, props, mean_scale(transform));
+        // Every painted path takes its turn in the scan's overprint list, a held one too.
+        st.overprint = self.path_overprint();
+        let n = Node::path(self.id(), PathData::from_bezpath(&bp), Appearance { items: vec![AppearanceItem::Stroke(st)], ..Default::default() });
+        if let Some(line) = &mut self.text {
+            line.held.push(n);
+        }
+        true
     }
 
     /// Convert a hayro paint to a VectorCraft paint and opacity (`stroke`: for a stroke).
@@ -1299,7 +1345,10 @@ impl<'p> Builder<'p> {
             return s.clone();
         }
         let page = self.page;
-        let spec = match self.nested(page, |b| m.interpret(b)) {
+        let saved = std::mem::replace(&mut self.white_images, m.mask_type() == MaskType::Alpha);
+        let art = self.nested(page, |b| m.interpret(b));
+        self.white_images = saved;
+        let spec = match art {
             Some(art) => {
                 let [r, g, b, _] = m.background_color().to_rgba().components();
                 let backdrop = luminance(&Color::rgb(r, g, b));
@@ -1330,10 +1379,15 @@ impl<'p> Builder<'p> {
         {
             return Some(Paint::Pattern { pattern: name.clone(), xf });
         }
+        // A swatch is shared with uses outside an alpha mask, and pattern paints keep their
+        // colours there: its images are read as they are.
+        let white = std::mem::take(&mut self.white_images);
         let art = self.nested(Rect::ZERO, |b| {
             // A cell whose content can't be decoded is empty.
             let _ = t.interpret(b, Affine::IDENTITY, stroke);
-        })?;
+        });
+        self.white_images = white;
+        let art = art?;
         let sig = paints(&art);
         let entry = self.pattern_keys.entry(key).or_default();
         entry.0 += 1;
@@ -1652,6 +1706,10 @@ impl<'a> Device<'a> for Builder<'_> {
 
     fn draw_path(&mut self, path: &BezPath, transform: Affine, paint: &hayro_interpret::Paint<'a>, draw_mode: &PathDrawMode) {
         self.flush_glyphs();
+        if self.hold_glyph_stroke(path, transform, paint, draw_mode) {
+            self.pending = false;
+            return;
+        }
         self.flush_text();
         self.pending = false;
         let overprint = self.path_overprint();
@@ -1754,14 +1812,12 @@ impl<'a> Device<'a> for Builder<'_> {
                 (*isolate, *knockout) = (i, k);
             }
         }
-        let bb = clip_path.path.bounding_box();
-        // Clips that contain the whole page do nothing visible; don't create groups for them.
+        // Clips that contain the whole page do nothing visible; don't create groups for them. Only
+        // a polygon that really covers it counts: a diamond touching the page edges has the page
+        // as its bounding box but cuts its corners away (#1542).
         let redundant = clip_path.path.elements().len() <= 6
-            && bb.x0 <= self.page.x0 + 0.01
-            && bb.y0 <= self.page.y0 + 0.01
-            && bb.x1 >= self.page.x1 - 0.01
-            && bb.y1 >= self.page.y1 - 0.01
-            && self.page.area() > 0.0;
+            && self.page.area() > 0.0
+            && vectorcraft_geom::hit::polygon_covers_rect(&clip_path.path, self.page, 0.01);
         let kind = if redundant { FrameKind::Skip } else { FrameKind::Clip(Box::new(self.clip_node(&clip_path.path, fill_rule(clip_path.fill)))) };
         self.stack.push(Frame::new(kind));
     }
@@ -1834,12 +1890,14 @@ impl<'a> Device<'a> for Builder<'_> {
         self.pending = false;
         match image {
             Image::Raster(r) => {
-                let key = hayro_interpret::CacheKey::cache_key(&r);
+                let white = self.white_images;
+                // Inside an alpha mask the same image is read again, white (its own cache key).
+                let key = hayro_interpret::CacheKey::cache_key(&r) ^ if white { WHITE_KEY } else { 0 };
                 let st = r.stream();
                 let (w, h) = (r.width(), r.height());
                 // CMYK images keep their samples (read once per image).
-                let known = self.cmyk_keys.contains(&key);
-                let cmyk = if known {
+                let known = !white && self.cmyk_keys.contains(&key);
+                let cmyk = if known || white {
                     None
                 } else {
                     crate::import_image::cmyk(st, w, h).unwrap_or_else(|why| {
@@ -1858,7 +1916,8 @@ impl<'a> Device<'a> for Builder<'_> {
                 let dict = st.dict();
                 let filters = st.filters();
                 let cs_ok = dict.get::<Name<'_>>(b"ColorSpace").is_some_and(|n| matches!(n.as_ref(), b"DeviceRGB" | b"DeviceGray"));
-                let jpeg = filters.len() == 1
+                let jpeg = !white
+                    && filters.len() == 1
                     && matches!(filters[0], hayro_syntax::Filter::DctDecode)
                     && cs_ok
                     && !dict.contains_key(b"SMask")
@@ -1875,6 +1934,7 @@ impl<'a> Device<'a> for Builder<'_> {
                         let (w, h, sf) = (img.width(), img.height(), img.scale_factors());
                         let a = alpha.map(|a| resize_alpha(&a, w, h)).unwrap_or_else(|| vec![255; (w * h) as usize]);
                         let rgba: Vec<u8> = match img {
+                            _ if white => a.into_iter().flat_map(|a| [255, 255, 255, a]).collect(),
                             ImageData::Rgb(d) => d.data.as_chunks::<3>().0.iter().zip(a).flat_map(|(c, a)| [c[0], c[1], c[2], a]).collect(),
                             ImageData::Luma(d) => d.data.iter().zip(a).flat_map(|(g, a)| [*g, *g, *g, a]).collect(),
                         };
@@ -1890,11 +1950,13 @@ impl<'a> Device<'a> for Builder<'_> {
                 self.add_image(key, || rgba_png(rgba, w, h).map(|png| (ImageBlob::new("image/png", png), w, h)), xf);
             }
             Image::Stencil(s) => {
-                let key = hayro_interpret::CacheKey::cache_key(&s);
+                let white = self.white_images;
+                let key = hayro_interpret::CacheKey::cache_key(&s) ^ if white { WHITE_KEY } else { 0 };
                 let mut decoded: Option<Decoded> = None;
                 s.with_stencil(
                     |luma, paint| {
                         let rgb = match paint {
+                            _ if white => [255, 255, 255, 255],
                             hayro_interpret::Paint::Color(c) => c.to_rgba().to_rgba8(),
                             _ => [0, 0, 0, 255],
                         };

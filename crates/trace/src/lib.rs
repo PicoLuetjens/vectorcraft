@@ -34,8 +34,9 @@
 //!    Lines also straightens slightly curved runs and makes arcs of parts of circles.
 //!
 //! With **Create: Strokes**, the parts of a colour layer no wider than the stroke width are traced
-//! as stroked centre lines instead (see `centerline`); without Fills, wider parts become stroked
-//! outlines.
+//! as stroked centre lines instead (see `centerline`): placed in the middle of their ink to a
+//! fraction of a pixel, as wide as their ink, and fitted as outlines are. Without Fills, wider
+//! parts become stroked outlines.
 //!
 //! Colour layers are traced either *abutting* (each colour's own area; shapes share edges) or
 //! *overlapping* (stacked: each layer also covers every layer above it, so no hairline gaps).
@@ -44,9 +45,12 @@
 mod centerline;
 mod contour;
 mod fit;
+mod gradient;
+mod group;
 mod logo;
 mod mosaic;
 mod quantize;
+mod shapes;
 mod smooth;
 mod subpixel;
 
@@ -56,8 +60,10 @@ use serde::{Deserialize, Serialize};
 use vectorcraft_geom::PathData;
 
 pub use contour::{Component, Loop, trace_mask};
+pub use gradient::TracedGradient;
 pub use mosaic::mosaic;
 pub use quantize::{FULL_TONE_MAX, Quantized, TRANSPARENT, denoise, quantize};
+pub use shapes::TracedShape;
 use subpixel::Crack;
 
 /// Errors decoding a raster.
@@ -269,11 +275,23 @@ pub struct TraceParams {
     /// `noise / 10` pixels of the source image.)
     pub noise: u32,
     pub method: Method,
-    /// Drop white areas (no white background shape).
+    /// Ignore Color: drop the areas of one colour (no background shape): white, unless
+    /// `ignore_color` names another.
     pub ignore_white: bool,
+    /// The colour Ignore Color leaves out (`#rrggbb`): the palette colours within about 30 levels
+    /// of it. `None` is white. (Flat Logo mode leaves out white only.)
+    pub ignore_color: Option<String>,
     /// Replace nearly-straight curves with straight lines. In Logo mode this also snaps tight arcs
     /// to true circles.
     pub snap_curves_to_lines: bool,
+    /// Shapes: a filled outline that is a circle, an ellipse, a rectangle (square or rounded
+    /// corners) or a regular polygon comes out as exactly that shape ([`TracedPath::shape`]).
+    pub shapes: bool,
+    /// Auto Grouping: say which path lies inside which ([`TraceResult::parents`]).
+    pub auto_grouping: bool,
+    /// Gradients (Grayscale and Color): an area whose colour changes evenly along one direction
+    /// is one path filled with a linear gradient ([`TracedPath::gradient`]), not bands of colour.
+    pub gradients: bool,
     /// Create: trace areas as filled shapes.
     pub fills: bool,
     /// Create: trace lines no wider than `stroke_width` as stroked centre lines.
@@ -302,7 +320,11 @@ impl Default for TraceParams {
             noise: 25,
             method: Method::Abutting,
             ignore_white: false,
+            ignore_color: None,
             snap_curves_to_lines: false,
+            shapes: false,
+            auto_grouping: false,
+            gradients: false,
             fills: true,
             strokes: false,
             stroke_width: 10.0,
@@ -312,20 +334,10 @@ impl Default for TraceParams {
 }
 
 impl TraceParams {
-    /// Maximum distance (px) of polygon vertices from the pixel boundary.
-    fn polygon_tolerance(&self) -> f64 {
-        let f = (self.paths / 100.0).clamp(0.0, 1.0);
-        0.55 + 0.75 * (1.0 - f)
-    }
-    /// Curve fitting tolerance (px).
-    fn fit_tolerance(&self) -> f64 {
-        let f = (self.paths / 100.0).clamp(0.0, 1.0);
-        0.2 + 1.6 * (1.0 - f)
-    }
     /// How outlines are fitted: Paths sets how closely the curves follow the edge (0.08 px at 100,
     /// 0.33 px at 50, 0.78 px at 0), Corners the turn that makes a corner (35° at 100, 90° at 0).
-    /// Straight edges are always lines; Snap Curves To Lines also straightens slightly curved ones
-    /// and makes parts of circles true arcs.
+    /// Straight edges are always lines; Snap Curves To Lines also straightens slightly curved ones,
+    /// makes parts of circles true arcs, and makes lines within 2.5° of level or upright exactly so.
     fn outline_style(&self) -> logo::Style {
         // Parameters come from users and agents: a NaN or infinity must not reach the geometry.
         let unit = |v: f64, default: f64| if v.is_finite() { (v / 100.0).clamp(0.0, 1.0) } else { default };
@@ -340,19 +352,16 @@ impl TraceParams {
             circle_tol: if snap { 0.3 } else { 0.15 },
             restore: Some(logo::RestoreParams::default()),
             check_step: 0.15,
+            upright: snap,
             ..logo::Style::default()
         }
-    }
-    /// Turn angle (degrees) above which a polygon vertex stays a corner.
-    fn corner_angle(&self) -> f64 {
-        let c = (self.corners / 100.0).clamp(0.0, 1.0);
-        150.0 - 115.0 * c
     }
 }
 
 /// Built-in preset names in panel order (our own parameter sets).
 pub const PRESET_NAMES: &[&str] = &[
     "Default",
+    "Auto Color",
     "High Fidelity Photo",
     "Low Fidelity Photo",
     "3 Colors",
@@ -364,6 +373,7 @@ pub const PRESET_NAMES: &[&str] = &[
     "Silhouettes",
     "Line Art",
     "Technical Drawing",
+    "Outline",
     "Flat Logo",
 ];
 
@@ -392,6 +402,10 @@ pub fn preset(name: &str) -> Option<TraceParams> {
     };
     Some(match key.as_str() {
         "default" => d,
+        // A posterised image of a photo or of artwork: its own colours where it is flat art, as
+        // many as its tones need where it is not.
+        // (Color detail 85: a colour on a hundredth of the picture is still one of its colours.)
+        "auto color" => TraceParams { palette: Palette::Automatic, color_detail: 85.0, ..color(6, 65.0, 60.0, 16, Method::Abutting) },
         "high fidelity photo" => color(64, 90.0, 25.0, 4, Method::Overlapping),
         "low fidelity photo" => color(20, 60.0, 50.0, 12, Method::Overlapping),
         "3 colors" => color(3, 60.0, 60.0, 20, Method::Abutting),
@@ -403,6 +417,8 @@ pub fn preset(name: &str) -> Option<TraceParams> {
         "silhouettes" => bw(200, 40.0, 60.0, 30, false),
         "line art" => bw(128, 80.0, 70.0, 10, false),
         "technical drawing" => bw(128, 95.0, 90.0, 4, true),
+        // Black outlines: lines as stroked centre lines, wider areas as stroked outlines.
+        "outline" => TraceParams { fills: false, strokes: true, ..bw(128, 80.0, 70.0, 10, false) },
         // Flat-colour logos: colours found automatically, edges placed to a fraction of a pixel.
         "flat logo" => TraceParams { mode: Mode::Logo, colors: 8, paths: 60.0, corners: 50.0, noise: 6, snap_curves_to_lines: true, ..d },
         _ => return None,
@@ -426,6 +442,10 @@ pub struct TracedPath {
     /// Create Strokes: the path is stroked this wide (px), not filled (centre lines, or the
     /// outlines of wider areas without Fills).
     pub stroke: Option<f64>,
+    /// Shapes: the shape the path is, exactly (`path` is that shape's outline).
+    pub shape: Option<TracedShape>,
+    /// Gradients: the linear gradient the path is filled with (`color` is its middle colour).
+    pub gradient: Option<TracedGradient>,
 }
 
 /// The traced result, bottom-most path first.
@@ -434,6 +454,9 @@ pub struct TraceResult {
     pub paths: Vec<TracedPath>,
     /// Colours actually used.
     pub palette: Vec<[u8; 3]>,
+    /// Auto Grouping: for each of `paths`, the path it lies inside, if any (empty without the
+    /// option). Each path drawn before those inside it paints what `paths` paints in its order.
+    pub parents: Vec<Option<usize>>,
 }
 
 impl TraceResult {
@@ -444,6 +467,14 @@ impl TraceResult {
 
 fn is_white(c: [u8; 3]) -> bool {
     c.iter().all(|&v| v >= 245)
+}
+
+/// Whether Ignore Color leaves palette colour `c` out: `target` is the colour picked (`None`: white).
+fn is_ignored(c: [u8; 3], target: Option<[u8; 3]>) -> bool {
+    match target {
+        None => is_white(c),
+        Some(t) => (0..3).map(|k| (f64::from(c[k]) - f64::from(t[k])).powi(2)).sum::<f64>() <= 30.0 * 30.0 || (is_white(t) && is_white(c)),
+    }
 }
 
 /// Trace `img` with `params`. Failures (an image Logo mode refuses, say) give an empty result: use
@@ -461,13 +492,54 @@ pub fn trace_within(img: &Raster, params: &TraceParams, max_anchors: usize) -> R
     if w == 0 || h == 0 || img.rgba.len() != w * h * 4 {
         return Ok(TraceResult::default());
     }
+    let mut out = trace_paths(img, params, max_anchors)?;
+    if params.auto_grouping {
+        // Abutting areas cannot overlap; stacked layers, Logo's shapes and stroked lines can.
+        let stacked = params.method == Method::Overlapping || params.mode == Mode::Logo || params.strokes;
+        out.parents = group::parents(&out.paths, img.width as usize, img.height as usize, stacked);
+    }
+    Ok(out)
+}
+
+fn trace_paths(img: &Raster, params: &TraceParams, max_anchors: usize) -> Result<TraceResult, TraceError> {
+    let (w, h) = (img.width as usize, img.height as usize);
     if params.mode == Mode::Logo {
         return logo::trace_logo(img, params, max_anchors);
     }
+    // The colour Ignore Color leaves out, if not white.
+    let ignore = match &params.ignore_color {
+        Some(name) if params.ignore_white => Some(logo::parse_hex(name).ok_or_else(|| TraceError::BadPalette(name.clone()))?),
+        _ => None,
+    };
     // A photo is traced from a copy with its noise smoothed away (see `smooth`).
     let smoothed = (params.mode != Mode::BlackAndWhite && quantize::continuous_tone(img)).then(|| smooth::smoothed(img));
     let img = smoothed.as_ref().unwrap_or(img);
-    let mut q = quantize(img, params);
+    // Gradients are found first and kept out of the palette: no colour is spent on bands of them.
+    let found = (params.gradients && params.mode != Mode::BlackAndWhite).then(|| gradient::detect(img)).filter(|f| !f.1.is_empty());
+    let without = found.as_ref().map(|(of, _)| {
+        let mut rest = img.clone();
+        for (p, &g) in rest.rgba.as_chunks_mut::<4>().0.iter_mut().zip(of) {
+            if g != u32::MAX {
+                p[3] = 0;
+            }
+        }
+        rest
+    });
+    let mut q = quantize(without.as_ref().unwrap_or(img), params);
+    drop(without);
+    // Each gradient is a palette entry of its own (its colour: the gradient's middle).
+    let mut gradients: Vec<Option<TracedGradient>> = vec![None; q.palette.len()];
+    if let Some((mut of, found)) = found {
+        gradient::settle_edges(img, &mut of, &found, &mut q.labels);
+        let first = q.palette.len();
+        for (l, &g) in q.labels.iter_mut().zip(&of) {
+            if g != u32::MAX {
+                *l = u16::try_from(first + g as usize).unwrap_or(TRANSPARENT);
+            }
+        }
+        q.palette.extend(found.iter().map(|g| g.color_at(g.start.midpoint(g.end)).map(|v| v.round().clamp(0.0, 255.0) as u8)));
+        gradients.extend(found.into_iter().map(Some));
+    }
     denoise(&mut q.labels, w, h, params.noise as usize);
     // Pixel count per palette entry, and the box its pixels lie in.
     let mut counts = vec![0usize; q.palette.len()];
@@ -500,21 +572,17 @@ pub fn trace_within(img: &Raster, params: &TraceParams, max_anchors: usize) -> R
         rank[i] = r;
     }
     let layers: Vec<(usize, usize)> =
-        order.iter().copied().enumerate().filter(|&(_, ci)| !(params.ignore_white && is_white(q.palette[ci]))).collect();
+        order.iter().copied().enumerate().filter(|&(_, ci)| !(params.ignore_white && is_ignored(q.palette[ci], ignore))).collect();
     let job = Layers {
         q: &q,
         rank: &rank,
         params,
         img,
+        ignore,
         boxes,
+        gradients: &gradients,
         bw_tones: bw_tones(img, &q),
         style: params.outline_style(),
-        opts: fit::FitOptions {
-            polygon_tol: params.polygon_tolerance(),
-            fit_tol: params.fit_tolerance(),
-            corner_angle: params.corner_angle(),
-            snap_lines: params.snap_curves_to_lines,
-        },
         w,
         h,
         anchors: AtomicUsize::new(0),
@@ -536,17 +604,32 @@ pub fn trace_within(img: &Raster, params: &TraceParams, max_anchors: usize) -> R
     Ok(out)
 }
 
-/// The mean luminance of the pixels labelled 0 (white) and 1 (black) of a Black and White
-/// quantisation: pure white and black where a side has no pixel.
+/// The luminance of white and of black in a Black and White quantisation: what its lightest
+/// white pixels and its darkest black ones have (the 98th and 2nd percentiles; pure white and
+/// black where a side has no pixel). Not the means: where the black is thin lines, blurred or
+/// scanned, most black pixels are part paper, their mean is a gray, and read against it the middle
+/// of every line would count as more than all ink, now more and now less as the line crosses the
+/// pixel rows, which put a ripple on its edges.
 fn bw_tones(img: &Raster, q: &Quantized) -> [f64; 2] {
-    let (mut sum, mut n) = ([0.0f64; 2], [0.0f64; 2]);
+    let mut hist = [[0u64; 256]; 2];
     for (p, &l) in img.rgba.as_chunks::<4>().0.iter().zip(&q.labels) {
-        if let (Some(s), Some(n)) = (sum.get_mut(l as usize), n.get_mut(l as usize)) {
-            *s += (f64::from(p[0]) * 299.0 + f64::from(p[1]) * 587.0 + f64::from(p[2]) * 114.0) / 1000.0;
-            *n += 1.0;
+        if let Some(h) = hist.get_mut(l as usize) {
+            h[((u32::from(p[0]) * 299 + u32::from(p[1]) * 587 + u32::from(p[2]) * 114 + 500) / 1000).min(255) as usize] += 1;
         }
     }
-    [if n[0] > 0.0 { sum[0] / n[0] } else { 255.0 }, if n[1] > 0.0 { sum[1] / n[1] } else { 0.0 }]
+    // The luminance a share `at` of the side's pixels are darker than.
+    let percentile = |h: &[u64; 256], at: f64, none: f64| {
+        let total: u64 = h.iter().sum();
+        let mut seen = 0;
+        for (v, n) in h.iter().enumerate() {
+            seen += n;
+            if total > 0 && seen as f64 >= at * total as f64 {
+                return v as f64;
+            }
+        }
+        none
+    };
+    [percentile(&hist[0], 0.98, 255.0), percentile(&hist[1], 0.02, 0.0)]
 }
 
 /// What tracing one colour layer needs.
@@ -556,14 +639,16 @@ struct Layers<'a> {
     rank: &'a [usize],
     params: &'a TraceParams,
     img: &'a Raster,
+    /// The colour Ignore Color leaves out, if not white.
+    ignore: Option<[u8; 3]>,
     /// The box each palette entry's pixels lie in: `(x0, y0, x1, y1)`, the far sides excluded.
     boxes: Vec<Option<(usize, usize, usize, usize)>>,
-    /// Black and White: the mean luminance of the white pixels and of the black ones.
+    /// Gradients: the gradient each palette entry is, if it is one.
+    gradients: &'a [Option<TracedGradient>],
+    /// Black and White: the luminance of white and of black (see `bw_tones`).
     bw_tones: [f64; 2],
-    /// How outlines are fitted.
+    /// How outlines and centre lines are fitted.
     style: logo::Style,
-    /// How centre lines are fitted.
-    opts: fit::FitOptions,
     w: usize,
     h: usize,
     /// Anchor points made so far, by every layer.
@@ -575,7 +660,7 @@ impl Layers<'_> {
     /// Ignore White: white is no part of any layer (stacked layers reach under the layers above
     /// them, and must not reach under white that is left out).
     fn ignored(&self, label: u16) -> bool {
-        self.params.ignore_white && self.q.palette.get(label as usize).is_some_and(|c| is_white(*c))
+        self.params.ignore_white && self.q.palette.get(label as usize).is_some_and(|c| is_ignored(*c, self.ignore))
     }
     /// The region across a crack, for cutting outlines at their junctions: the outside pixel's
     /// colour. Stacked layers end on many colours at once and share no edge: one neighbour.
@@ -620,7 +705,7 @@ impl Layers<'_> {
     /// How far the edge lies from a crack between two pixels, towards the outside one (−0.5 to 0.5).
     ///
     /// Each pixel of the column across the crack is read as a blend of the tones on its two sides
-    /// (the two pixels' palette colours; in Black and White the mean luminance of the black and of
+    /// (the two pixels' palette colours; in Black and White the luminance of the image's black and of
     /// the white pixels). The edge is where the blends, summed, put it: as far out as there is
     /// inside tone in the outside pixels, less the outside tone in the inside ones (two pixels each
     /// way, while they are on the same side and no more blended than the pixel before: more would be
@@ -641,12 +726,31 @@ impl Layers<'_> {
             return 0.0;
         }
         let bw = self.params.mode == Mode::BlackAndWhite;
+        // Black and White: black is the image's black; white is the lightest pixel within a few
+        // pixels of the crack, the paper as it is here (a scan's paper is darker in one corner than
+        // in another, and read against the image's lightest white it would count as part ink).
+        let black = self.bw_tones[1];
+        let white = if bw {
+            let light = (-3..=4)
+                .filter_map(|k| c.at(k).and_then(|i| self.img.rgba.get(i * 4..i * 4 + 3)))
+                .map(|p| (f64::from(p[0]) * 299.0 + f64::from(p[1]) * 587.0 + f64::from(p[2]) * 114.0) / 1000.0);
+            light.fold(f64::NEG_INFINITY, f64::max).clamp((black + 32.0).min(self.bw_tones[0]), self.bw_tones[0])
+        } else {
+            self.bw_tones[0]
+        };
         let (ca, cb) = if bw {
-            let tone = |l: u16| [self.bw_tones[usize::from(l == 1)]; 3];
+            let tone = |l: u16| [if l == 1 { black } else { white }; 3];
             (tone(la), tone(lb))
         } else {
-            let (Some(ca), Some(cb)) = (self.q.palette.get(la as usize), self.q.palette.get(lb as usize)) else { return 0.0 };
-            (ca.map(f64::from), cb.map(f64::from))
+            // A side's own colour: its palette entry's, or its gradient's colour here.
+            let own = |l: u16, k: i32| {
+                let flat = self.q.palette.get(l as usize)?.map(f64::from);
+                let Some(g) = self.gradients.get(l as usize).and_then(Option::as_ref) else { return Some(flat) };
+                let i = c.at(k)?;
+                Some(g.color_at(vectorcraft_geom::Point::new((i % self.w) as f64 + 0.5, (i / self.w) as f64 + 0.5)))
+            };
+            let (Some(ca), Some(cb)) = (own(la, 0), own(lb, 1)) else { return 0.0 };
+            (ca, cb)
         };
         let d = [0, 1, 2].map(|k| cb[k] - ca[k]);
         let len2: f64 = d.iter().map(|v| v * v).sum();
@@ -700,7 +804,6 @@ impl Layers<'_> {
         };
         if bw {
             // The share of black at which a pixel turns black.
-            let (white, black) = (self.bw_tones[0], self.bw_tones[1]);
             let turn = ((white - f64::from(self.params.threshold)) / (white - black).max(1.0)).clamp(0.02, 0.98);
             shift += if la == 1 { 1.0 } else { -1.0 } * (0.5 - turn) / steep;
         }
@@ -710,13 +813,15 @@ impl Layers<'_> {
     /// The paths of layer `r` (palette entry `ci`), or `None` once the anchors made pass the
     /// maximum.
     fn layer(&self, r: usize, ci: usize) -> Option<Vec<TracedPath>> {
-        let (params, opts) = (self.params, &self.opts);
+        let params = self.params;
         let color = *self.q.palette.get(ci)?;
         let overlapping = params.method == Method::Overlapping;
         let (w, h) = (self.w, self.h);
         // Create Strokes: this colour's lines, left out of its areas.
         let (thin, lines) = if params.strokes {
-            centerline::lines(&self.q.labels, u16::try_from(ci).unwrap_or(TRANSPARENT), w, h, params.stroke_width, opts)
+            // The ink the lines are read against: the layer's colour; Black and White's own black.
+            let ink = if params.mode == Mode::BlackAndWhite { [self.bw_tones[usize::from(ci == 1)]; 3] } else { color.map(f64::from) };
+            centerline::lines(&self.q.labels, u16::try_from(ci).unwrap_or(TRANSPARENT), w, h, params.stroke_width, self.img, ink, &self.style)
         } else {
             (vec![], vec![])
         };
@@ -741,12 +846,14 @@ impl Layers<'_> {
         let area_stroke = (params.strokes && !params.fills).then_some(1.0);
         let min_hole = params.noise.max(1) as i64;
         let mut paths = vec![];
-        let mut add = |path: PathData, pixels: usize, stroke: Option<f64>| {
+        let mut add = |path: PathData, pixels: usize, stroke: Option<f64>, shape: Option<TracedShape>| {
             let n = path.anchor_count();
             if self.anchors.fetch_add(n, Ordering::Relaxed).saturating_add(n) > self.max_anchors {
                 return false;
             }
-            paths.push(TracedPath { path, color, pixels, stroke });
+            // (A gradient fills; a stroked line of it is its middle colour.)
+            let gradient = self.gradients.get(ci).cloned().flatten().filter(|_| stroke.is_none());
+            paths.push(TracedPath { path, color, pixels, stroke, shape, gradient });
             true
         };
         let mut comps = trace_mask(&mask, bw, bh);
@@ -768,12 +875,18 @@ impl Layers<'_> {
                 }
                 subs.extend(fit(hole));
             }
-            if !add(PathData::new(subs), comp.pixels, area_stroke) {
+            // Shapes: a filled outline without holes that is a shape becomes that shape.
+            let shape = match subs.as_slice() {
+                [only] if params.shapes && area_stroke.is_none() => shapes::recognise(only),
+                _ => None,
+            };
+            let path = shape.map_or_else(|| PathData::new(subs), |s| s.path());
+            if !add(path, comp.pixels, area_stroke, shape) {
                 return None;
             }
         }
         for line in lines {
-            if !add(line.path, line.pixels, Some(line.width)) {
+            if !add(line.path, line.pixels, Some(line.width), None) {
                 return None;
             }
         }
