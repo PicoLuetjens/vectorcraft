@@ -1223,7 +1223,7 @@ impl Session {
     }
     /// Text layout bounds are a cache (not saved): compute them for a document just read, or
     /// selection boxes and hit testing would use the rough estimate until each text is edited.
-    fn refresh_text_bounds(doc: &mut Document) {
+    pub(crate) fn refresh_text_bounds(doc: &mut Document) {
         // Inline graphics in text take their size from their symbols' art (not saved either).
         doc.resolve_inline_art();
         let mut texts = vec![];
@@ -1573,13 +1573,17 @@ impl Session {
                 st.selection.clone_from(&it.selection);
             }
         }
+        // The previous preview's paint is undone with it.
+        self.pending_paint = None;
         let rw = cmd::distortcmds::perspective_rewrite(self, cmd, params);
         let (cmd, params) = rw.as_ref().map_or((cmd, params), |(c, p)| (c.as_str(), p));
         let r = self.execute(cmd, params);
         let params = self.noted(params);
         let st = self.doc_mut()?;
         if let Some(it) = &mut st.interaction {
-            it.preview = Some((cmd.to_string(), params));
+            // A failed preview leaves the document at the snapshot, so nothing is left to commit
+            // (not even an earlier successful preview, which the reset above already undid).
+            it.preview = r.is_ok().then(|| (cmd.to_string(), params));
         }
         r
     }
@@ -1944,6 +1948,8 @@ mod tests_swatchcmds;
 mod tests_swatches;
 #[cfg(test)]
 mod tests_swatchlib;
+#[cfg(test)]
+mod tests_symbolbounds;
 #[cfg(test)]
 mod tests_targeting;
 #[cfg(test)]

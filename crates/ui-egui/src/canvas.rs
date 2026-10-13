@@ -3,7 +3,7 @@
 
 use egui::{Color32, CornerRadius, Pos2, Sense, Shape, Stroke, StrokeKind, Ui, Vec2, pos2, vec2};
 use serde_json::json;
-use vectorcraft_doc::{Node, NodeKind, Unit};
+use vectorcraft_doc::{Node, NodeKind, SymbolBoxes, Unit};
 use vectorcraft_geom::{Affine, BezPath, PathEl, Point, Rect};
 use vectorcraft_tools::{Cursor, Mods, Overlay, PointerEvent, PointerKind};
 
@@ -484,7 +484,8 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
             {
                 crate::place::paint_cursor(app, ui.ctx(), &painter, hp);
             }
-            // Caps Lock gives precise (crosshair) cursors, like Illustrator; env opt-out for system cursors.
+            // The glyph cursors are drawn here; General › Use Precise Cursors (the session turns the drawing tools' pointers
+            // into crosshairs, `Cursor::precise`) needs no handling. VECTORCRAFT_SYSTEM_CURSORS opts out of the glyphs.
             let custom = std::env::var_os("VECTORCRAFT_SYSTEM_CURSORS").is_none();
             // User Interface › Scale Cursor Proportional to UI: the glyphs grow with UI Scaling;
             // off, they keep their size.
@@ -492,7 +493,7 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
             match ui.input(|i| i.pointer.hover_pos()) {
                 // An OS cursor: the system moves it at once, where a painted one trails the pointer
                 // (#444). The system cursor stands in for cursors without a glyph.
-                Some(_) if custom && crate::cursors::OS_CURSORS => {
+                Some(_) if custom && crate::cursors::os_cursors(crate::cursors::OS_CURSORS, app.services.wayland) => {
                     let ppp = ui.ctx().pixels_per_point() / ui_scale;
                     ui.ctx().set_cursor_image(app.canvas.cursors.get(c, ppp));
                     cursor_icon(c)
@@ -1276,8 +1277,8 @@ fn c32(rgb: [u8; 3]) -> Color32 {
 }
 
 /// Outline of a node for highlighting (paths, compound children, area type frames, other
-/// text/image bounds).
-fn node_outline(n: &Node) -> BezPath {
+/// text/image bounds, symbol instances' bounds measured by their art from `symbols`).
+fn node_outline(n: &Node, symbols: &SymbolBoxes) -> BezPath {
     let mut bp = BezPath::new();
     walk_drawn(n, &mut |c| match &c.kind {
         NodeKind::Path { path, .. } => bp.extend(path.to_bezpath()),
@@ -1289,7 +1290,7 @@ fn node_outline(n: &Node) -> BezPath {
             }
         }
         NodeKind::Text(_) | NodeKind::Image(_) | NodeKind::SymbolInstance { .. } => {
-            if let Some(b) = c.geometric_bounds() {
+            if let Some(b) = c.geometric_bounds_with(symbols) {
                 bp.extend(vectorcraft_geom::shapes::rectangle(b).to_bezpath());
             }
         }
@@ -1468,7 +1469,7 @@ fn hover_highlight(app: &VectorcraftApp, p: &egui::Painter, xf: &Xf) {
     }
     if let Some(n) = st.doc.node(id).filter(|n| !too_many_anchors([*n])) {
         let color = c32(st.doc.layer_color(id));
-        stroke_path(p, &node_outline(n), xf, Stroke::new(1.5, color));
+        stroke_path(p, &node_outline(n, &st.doc.symbol_boxes()), xf, Stroke::new(1.5, color));
     }
 }
 
@@ -1668,6 +1669,7 @@ fn selection_overlay(app: &mut VectorcraftApp, p: &egui::Painter, xf: &Xf, curve
     let big_bounds = if big { app.selection_bounds() } else { None };
     let app = &*app;
     let Some(st) = app.session.active() else { return };
+    let symbols = st.doc.symbol_boxes();
     let tool = app.session.tool_id();
     let direct = vectorcraft_tools::catalog::edits_anchors(tool);
     let curvature = tool == "curvature";
@@ -1687,9 +1689,9 @@ fn selection_overlay(app: &mut VectorcraftApp, p: &egui::Painter, xf: &Xf, curve
     // too many paths to outline.
     if let Some((k, n)) = st.selection.key.and_then(|k| Some((k, st.doc.node(k)?))) {
         let outline = if too_many_anchors([n]) {
-            n.geometric_bounds().map(|b| vectorcraft_geom::shapes::rectangle(b).to_bezpath())
+            n.geometric_bounds_with(&symbols).map(|b| vectorcraft_geom::shapes::rectangle(b).to_bezpath())
         } else {
-            Some(node_outline(n))
+            Some(node_outline(n, &symbols))
         };
         if let Some(bp) = outline {
             stroke_path(p, &bp, xf, Stroke::new(KEY_OUTLINE, c32(st.doc.layer_color(k))));
@@ -1700,7 +1702,7 @@ fn selection_overlay(app: &mut VectorcraftApp, p: &egui::Painter, xf: &Xf, curve
         let color = c32(st.doc.layer_color(*id));
         let partial = st.selection.partial(*id);
         // Path outlines.
-        stroke_path(p, &node_outline(n), xf, Stroke::new(1.0, color));
+        stroke_path(p, &node_outline(n, &symbols), xf, Stroke::new(1.0, color));
         // Anchors (and handles for selected anchors in direct mode); a gradient mesh's or a mesh
         // envelope's points.
         walk_drawn(n, &mut |c| {
@@ -1762,7 +1764,7 @@ fn selection_overlay(app: &mut VectorcraftApp, p: &egui::Painter, xf: &Xf, curve
         });
         // Centre point (Attributes panel → Show Center).
         if n.shows_center()
-            && let Some(b) = n.geometric_bounds()
+            && let Some(b) = n.geometric_bounds_with(&symbols)
         {
             anchor_square(p, xf.to_screen(b.center()), color, true, anchor(false));
         }
@@ -2209,6 +2211,32 @@ mod tests {
     use vectorcraft_engine::Session;
     use vectorcraft_geom::Shape as _;
 
+    /// With VECTORCRAFT_SYSTEM_CURSORS set the glyphs aren't drawn and the system's cursors stand in: those of
+    /// the Pen and the other drawing tools are the system crosshair already, so Use Precise Cursors makes no
+    /// difference to them there.
+    #[test]
+    fn system_cursors_show_the_same_crosshair_with_precise_cursors_on_or_off() {
+        for c in [
+            Cursor::Pen,
+            Cursor::PenAdd,
+            Cursor::PenDelete,
+            Cursor::PenClose,
+            Cursor::PenContinue,
+            Cursor::PenJoin,
+            Cursor::PenConvert,
+            Cursor::Eyedropper,
+            Cursor::Slice,
+            Cursor::Blend,
+            Cursor::BlendObject,
+            Cursor::BlendAnchor,
+            Cursor::ShapeBuilder,
+            Cursor::ShapeBuilderErase,
+        ] {
+            assert_eq!(cursor_icon(c), egui::CursorIcon::Crosshair, "{c:?}");
+            assert_eq!(cursor_icon(c), cursor_icon(c.precise()), "{c:?}");
+        }
+    }
+
     /// #826: in a turned view each ruler still has ticks along its whole length; at 0° the top one
     /// reads x where the canvas has it.
     #[test]
@@ -2298,9 +2326,27 @@ mod tests {
         let st = s.active().unwrap();
         let g = st.doc.node(st.selection.objects[0]).unwrap();
         assert!(g.extras().shaper.is_some());
-        let bounds = node_outline(g).bounding_box();
+        let symbols = st.doc.symbol_boxes();
+        let bounds = node_outline(g, &symbols).bounding_box();
         assert!((bounds.x0 - 100.0).abs() < 0.01 && (bounds.x1 - 200.0).abs() < 0.01, "{bounds:?}");
-        assert_eq!(node_outline(st.doc.node(line).unwrap()).bounding_box().x0, 50.0, "an isolated original still shows its full outline");
+        assert_eq!(node_outline(st.doc.node(line).unwrap(), &symbols).bounding_box().x0, 50.0, "an isolated original still shows its full outline");
+    }
+
+    #[test]
+    fn a_symbol_instance_is_outlined_around_its_art() {
+        // A symbol holding the square of the SVG import tests' `Star` symbol, 20 × 20 from (0, 0),
+        // and an instance of it at (20, 30).
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="120"><defs><symbol id="Star"><path d="M0 0H20V20H0Z" fill="#e0a000"/></symbol></defs><use href="#Star" x="20" y="30"/></svg>"##;
+        let mut s = Session::new();
+        s.execute("document.open", &json!({"name": "star.svg", "dataBase64": vectorcraft_format::base64_encode(svg.as_bytes())})).unwrap();
+        let st = s.active().unwrap();
+        let mut inst = None;
+        st.doc.walk(|n| {
+            if matches!(n.kind, NodeKind::SymbolInstance { .. }) {
+                inst = Some(n);
+            }
+        });
+        assert_eq!(node_outline(inst.unwrap(), &st.doc.symbol_boxes()).bounding_box(), Rect::new(20.0, 30.0, 40.0, 50.0));
     }
 
     /// One headless canvas frame on an 800 × 600 window.
