@@ -16,6 +16,7 @@ mod ink;
 mod live;
 mod lru;
 mod paint;
+pub use paint::decode_failures;
 mod pattern;
 pub mod placed_document;
 pub mod proof;
@@ -415,6 +416,9 @@ pub struct Renderer {
     /// Objects' content run through Photoshop-style effects, per object and content slot (see
     /// `fx`): kept only while drawn.
     pixel_fx: PtrMap<(usize, usize, Ink), fx::PixelEntry>,
+    /// What the contents of those rasters read from the document, and the color settings, as last
+    /// found for a frame (`stamp`) and document (address) (see [`Self::doc_inputs`]).
+    doc_inputs: Option<((u64, usize), Arc<fx::DocInputs>)>,
     /// Whether the group being drawn is a knockout group (what its neutral children inherit).
     knockout: bool,
     /// Address of the knockout-group element being drawn as its knockout shape: at full object
@@ -531,6 +535,7 @@ impl Renderer {
             brushes: Default::default(),
             shadows: PtrMap::default(),
             pixel_fx: PtrMap::default(),
+            doc_inputs: None,
             live: live::LiveCache::default(),
             knockout: false,
             shape_of: 0,
@@ -1019,7 +1024,13 @@ impl Renderer {
             && f.opts.dim_templates
             && !f.opts.skip_templates
         {
-            if !preview && !f.opts.outline {
+            // A template layer stays in Preview while the view is in Outline (and whatever its own
+            // Preview option says): its picture is there to be traced (#1486).
+            if *template && f.opts.outline {
+                let opts = RenderOptions { outline: false, ..f.opts.clone() };
+                return self.draw_node(ctx, &Frame { opts: &opts, ..*f }, n, force);
+            }
+            if !preview && !template && !f.opts.outline {
                 let opts = RenderOptions { outline: true, ..f.opts.clone() };
                 return self.draw_node(ctx, &Frame { opts: &opts, ..*f }, n, force);
             }

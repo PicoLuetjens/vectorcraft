@@ -194,8 +194,11 @@ pub fn import_with_report(bytes: &[u8], opts: &ImportOptions) -> Result<ImportRe
     b.unsure = route && ocgs.list.iter().any(|g| (all_on && !g.on) || !g.print);
     b.taken = taken;
     b.warnings = notes;
+    b.colors.uncalibrated_rgb = opts.uncalibrated_rgb && picked.iter().filter_map(|&n| pages.get(n)).any(crate::pages::has_private_data);
     let cache = InterpreterCache::new();
     let mut x = 0.0;
+    // Where the next page's art may begin (a `.ai` page's art reaches past its artboard).
+    let mut clear = f64::NEG_INFINITY;
     // Every page only text over private data: a file saved without its PDF part shows a notice
     // there, not its art. A page that states where its art is isn't that notice.
     let (mut only_text, mut art_boxes) = (true, false);
@@ -219,6 +222,8 @@ pub fn import_with_report(bytes: &[u8], opts: &ImportOptions) -> Result<ImportRe
         let xf = Affine::translate((x - frame.x0, -frame.y0)) * init;
         let mut ctx = Context::new(xf, ab, &cache, pdf.xref(), settings.clone());
         b.page = ab;
+        // The first id of this page's art.
+        let first_id = b.next;
         let scan = scan_page(page, &mut ocgs, all_on, &mut b.fonts);
         if route {
             let mut seen = HashSet::new();
@@ -266,6 +271,33 @@ pub fn import_with_report(bytes: &[u8], opts: &ImportOptions) -> Result<ImportRe
         if clipped {
             b.warn(PAST_PAGE_NOTE);
         }
+        // A `.ai` page keeps its art past the artboard edge, unclipped (#646), so a page whose art
+        // reaches far to the left would lay it over the page before it in the row: there it would
+        // be taken for that page's art (by the check against the editing data, which then finds
+        // art its layers don't have there, and by `place_pages`). Such a page moves right until its
+        // art clears the art before it.
+        let mut art_right = f64::NEG_INFINITY;
+        if ai && let Some(art) = parts.iter().flat_map(|(_, v)| v.iter()).filter_map(|n| n.visual_bounds()).reduce(|a, b| a.union(b)) {
+            // Art at a coordinate that isn't a number (a damaged file) moves nothing.
+            let dx = Some((clear - art.x0).max(0.0)).filter(|dx| dx.is_finite()).unwrap_or(0.0);
+            if dx > 0.0 {
+                let shift = Affine::translate((dx, 0.0));
+                for (_, v) in &mut parts {
+                    for n in v.iter_mut() {
+                        Arc::make_mut(n).transform(shift, false);
+                    }
+                }
+                // What the page's lines of type were is told where their glyphs are (the outlines
+                // stroked on them are looked for there), so that moves with them.
+                for facts in b.lines.iter_mut().filter(|(id, _)| id.0 >= first_id).map(|(_, facts)| facts) {
+                    for ink in &mut facts.ink {
+                        *ink = *ink + kurbo::Vec2::new(dx, 0.0);
+                    }
+                }
+                ab = Rect::new(ab.x0 + dx, ab.y0, ab.x1 + dx, ab.y1);
+            }
+            art_right = art.x1 + dx;
+        }
         let children: Vec<Arc<Node>> = parts.iter().flat_map(|(_, v)| v.iter().cloned()).collect();
         only_text &= ai && is_only_text(&children);
         art_boxes |= crate::pages::states_art(page);
@@ -277,6 +309,7 @@ pub fn import_with_report(bytes: &[u8], opts: &ImportOptions) -> Result<ImportRe
             ab = art;
         }
         x = right + opts.artboard_gap;
+        clear = right.max(art_right) + opts.artboard_gap;
         doc.artboards.push(Artboard {
             id: i as u32 + 1,
             name: format!("Artboard {}", i + 1),
@@ -1673,9 +1706,8 @@ impl<'a> Device<'a> for Builder<'_> {
             PathDrawMode::Stroke(props) => {
                 let mut st = stroke_layer(paint, opacity, props, mean_scale(transform));
                 st.overprint = overprint;
-                // Fill-then-stroke of the same path (the `B` operator, or a fill and a stroke of
-                // the outline as Illustrator writes an object) becomes one object: a path with a
-                // fill and a live stroke.
+                // Fill-then-stroke of the same path (the `B` operator, or a fill and then a stroke
+                // of the same outline) becomes one object: a path with a fill and a live stroke.
                 let blend = self.blend;
                 let fill = self.last_fill.take();
                 let last = match self.mask {
@@ -1687,6 +1719,10 @@ impl<'a> Device<'a> for Builder<'_> {
                     && let Some((id, outline)) = fill
                     && last.id == id
                     && last.blend == blend
+                    // Opacity or a mask of its own came from a transparency group the fill was
+                    // drawn in and this stroke wasn't.
+                    && last.opacity == 1.0
+                    && last.extras().mask.is_none()
                     && last.appearance.stroke().is_none()
                     && same_outline(&outline, &bp)
                 {

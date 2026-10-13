@@ -2691,6 +2691,8 @@ effect	Points	Punkte
 	Spiral Tool	Spirale-Werkzeug
 	Split Freeform Line	Freiformlinie teilen
 	Split Into Grid	In Raster teilen
+	Total:	Gesamt:
+	Add Guides	Hilfslinien hinzufügen
 	Split Into Grid…	In Raster teilen…
 	Split Path	Pfad teilen
 	spot	Vollton
@@ -3290,6 +3292,7 @@ theme	Appearance	Erscheinungsbild
 @msg	its page has text, and its layers have no text objects to put it in	seine Seite enthält Text, und seine Ebenen haben keine Textobjekte, die ihn aufnehmen könnten
 @msg	its type is to come in as outlines, which only its page has	sein Text soll als Pfade übernommen werden, die nur seine Seite enthält
 @msg	the art on them differs from the page's in {_1}% of it	die Grafik darauf weicht in {_1} % von der der Seite ab
+@msg	the art on them differs from the page's in {_1}% of it: they come from its editing data all the same	die Grafik darauf weicht in {_1} % von der der Seite ab: sie stammen trotzdem aus seinen Bearbeitungsdaten
 @msg	`to` must be "corner" or "smooth"	`to` muss "corner" oder "smooth" sein
 @msg	BMP files are RGB or grayscale: colorModel rgb or gray	BMP-Dateien sind RGB oder Graustufen: colorModel rgb oder gray
 @msg	Blend colors: select at least three objects with filled colours	Farben angleichen: Wählen Sie mindestens drei Objekte mit Flächenfarbe aus
@@ -4160,3 +4163,48 @@ theme	Appearance	Erscheinungsbild
 	Use Outside Rectangle As Frame	Äußeres Rechteck als Rahmen verwenden
 	Create Compound Path From Ellipses	Zusammengesetzten Pfad aus Ellipsen erstellen
 	Fill Grid	Raster füllen
+	Select two or more objects, or a group	Wählen Sie zwei oder mehr Objekte oder eine Gruppe aus
+# 3D and Materials › Extrude & Bevel, Inflate and Rotate: options, Position presets and bevel shapes.
+	Back	Hinten
+	Both sides	Beidseitig
+	Classic	Klassisch
+	Cove	Hohlkehle
+	Depth	Tiefe
+	Front	Vorne
+	Isometric Bottom	Isometrisch unten
+	Isometric Left	Isometrisch links
+	Isometric Right	Isometrisch rechts
+	Isometric Top	Isometrisch oben
+	Off-Axis Back	Schräg hinten
+	Off-Axis Bottom	Schräg unten
+	Off-Axis Front	Schräg vorne
+	Off-Axis Left	Schräg links
+	Off-Axis Right	Schräg rechts
+	Off-Axis Top	Schräg oben
+	Ogee	Karnies
+	Reset all 3D settings to their defaults.	Alle 3D-Einstellungen auf ihre Standardwerte zurücksetzen.
+	Step	Stufe
+	Taper	Verjüngung
+	Twist	Verdrehung
+	Volume	Volumen
+3d	Cap	Deckflächen
+3d	Solid	Massiv
+3d	Hollow	Hohl
+3d	Bevel	Abgeflachte Kante
+3d	Rounded	Abgerundet
+3d	Space	Abstand
+	Bevel Shape	Form der abgeflachten Kante
+	Bevel Inside	Abgeflachte Kante nach innen
+	Bevel both sides	Abgeflachte Kante beidseitig
+	Presets	Vorgaben
+@msg	An object takes one 3D effect. Edit the existing effect's options, or remove it first.	Ein Objekt kann nur einen 3D-Effekt haben. Bearbeiten Sie die Optionen des vorhandenen Effekts oder entfernen Sie ihn zuerst.
+@msg	{label} currently requires a path or compound path. Convert type, images and groups to paths first.	{label} erfordert derzeit einen Pfad oder zusammengesetzten Pfad. Wandeln Sie Text, Bilder und Gruppen zuerst in Pfade um.
+@msg	{label} requires a shape with at least two anchors	{label} erfordert eine Form mit mindestens zwei Ankerpunkten
+@msg	The shape is too complex for a 3D effect	Die Form ist für einen 3D-Effekt zu komplex
+@msg	The 3D surface is too complex; simplify the shape	Die 3D-Oberfläche ist zu komplex; vereinfachen Sie die Form
+	Transform Objects	Objekte transformieren
+@msg	unknown parameter `{key}`; did you mean `{near}`?	unbekannter Parameter `{key}`; meinten Sie `{near}`?
+@msg	unknown parameter `{key}`; the command takes no parameters	unbekannter Parameter `{key}`; der Befehl hat keine Parameter
+@msg	unknown parameter `{key}`; the command takes: {keys}	unbekannter Parameter `{key}`; der Befehl akzeptiert: {keys}
+	Load EPS into Clipboard	EPS in die Zwischenablage laden
+@msg	an image of {w} × {h} pixels is too large to draw	ein Bild mit {w} × {h} Pixeln ist zu groß, um gezeichnet zu werden

@@ -4580,6 +4580,7 @@ dependencies = [
  "vectorcraft-testkit",
  "vectorcraft-text",
  "windows",
+ "winsafe",
 ]
 
 [[package]]
@@ -4669,6 +4670,7 @@ dependencies = [
  "image",
  "kurbo 0.13.1",
  "ruzstd",
+ "serde_json",
  "vectorcraft-brush",
  "vectorcraft-color",
  "vectorcraft-doc",
@@ -4886,6 +4888,7 @@ name = "vectorcraft-three-d"
 version = "0.10.0"
 dependencies = [
  "vectorcraft-geom",
+ "vectorcraft-pathops",
 ]
 
 [[package]]

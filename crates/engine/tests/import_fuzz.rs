@@ -1290,6 +1290,13 @@ proptest! {
         survive("mutated EPS PostScript", || vectorcraft_eps::import(&bytes).ok().map(|r| r.document))?;
     }
 
+    /// A damaged EPS another app copied: Paste reads it as an error or as objects.
+    #[test]
+    fn pasted_eps_never_panics(cut in 0usize..400_000, edits in prop::collection::vec((0usize..400_000, any::<u8>()), 0..12)) {
+        static SAMPLE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        paste_from_elsewhere("clipboard.importEps", json!({"dataBase64": mutated_b64(SAMPLE.get_or_init(foreign_eps_sample).clone(), cut, &edits)}))?;
+    }
+
     /// Hostile PostScript programs: operators in any order with any operands, opened and placed;
     /// as files in the legacy Illustrator format too (the creator line is what turns on its
     /// documented `u` … `U` groups), the groups unbalanced, deep and among clips; in a layer, which
@@ -1838,6 +1845,24 @@ fn the_frames_fixture_reads_as_threaded_area_type_and_type_on_a_path() {
     assert_eq!(l.doc.text_threads.len(), 1);
 }
 
+/// The smallest failing input `eps_text_frames_never_panic` found: the first frame's bottom edge
+/// has a control point at x = 8e115 (`8e0115`). That frame holds no text, and the story flows on
+/// into the second frame.
+#[test]
+fn a_text_frame_with_a_control_point_at_8e115_opens_with_its_story_in_the_next_frame() {
+    let text = mutate_text(&frames_document_text(), 1397, &[(191, '1'), (1586, 'e')]);
+    assert!(text.contains(" 8e0115 "));
+    let l = vectorcraft_engine::cmd::fileio::load("x.eps", &text_eps_of(&text, FRAME_OBJECTS)).unwrap();
+    let mut texts = vec![];
+    l.doc.walk(|n| {
+        if let vectorcraft_doc::NodeKind::Text(t) = &n.kind {
+            texts.push(t.plain_text());
+        }
+    });
+    assert_eq!(texts, ["", "A story in two frames\nand more", "On a path"], "{:?}", l.warnings);
+    survive("a frame with a control point at 8e115 pt", || Some(l.doc)).unwrap();
+}
+
 /// An EPS with a hidden text object whose story is in `document`.
 fn text_eps(document: &str) -> Vec<u8> {
     text_eps_of(document, "/AI11Text :\n0 /FrameIndex ,\n0 /StoryIndex ,\n;\n")
@@ -1894,7 +1919,7 @@ proptest! {
                 *x = b;
             }
         }
-        survive("mutated .ai editing data", || Some(vectorcraft_eps::layered_ai(&private, Document::new(100.0, 100.0), vec![], false).0))?;
+        survive("mutated .ai editing data", || Some(vectorcraft_eps::layered_ai(&private, Document::new(100.0, 100.0), vec![], false, false).0))?;
     }
 }
 
@@ -2073,6 +2098,56 @@ fn arb_ai_token() -> impl Strategy<Value = String> {
             "`",
             "~",
             "\n%AI5_EndPlace\n",
+            "Xm",
+            "50 -50 -100 -100 5000 -2000 Xm",
+            "0 0 0 0 1e308 -1e308 Xm",
+            "Xd",
+            "0 1 Xd",
+            "1 0 Xd",
+            "XD",
+            "(00800080) Xt 0 XD",
+            "X!",
+            "/Mesh X!",
+            "/End X!",
+            "X#",
+            "(DeviceRGB) /CS X#",
+            "[0 0] /P X#",
+            "[1 0 0 1 0 0 10 10 12 10 1 8 10 1] /N X#",
+            "[1e308 -1e308 0] /N X#",
+            "0 /E X#",
+            "\n%AI9_BeginArtStyles\n",
+            "\n%AI9_EndArtStyles\n",
+            "/KnownStyle :",
+            "(style) /Name ,",
+            "/ActiveStyle :",
+            "/CompoundFilter :",
+            "/BasicFilter :",
+            "(Stroke Style Filter) 0 0 /Filter ,",
+            "(Fill Style Filter) 0 0 /Filter ,",
+            "(Adobe Outer Glow) 1 0 /Filter ,",
+            "(Adobe Drop Shadow) 1 0 /Filter ,",
+            "1 /Visible ,",
+            "2 /FillOrStroke ,",
+            "1 /Bool (BSDashAdj) ,",
+            "0.75 /Real (opac) ,",
+            "1e308 /Real (blur) ,",
+            "0 /Real ,",
+            "; (BSVariableWidthTValuesArray) ,",
+            "; (BSCenteredWidthsArray) ,",
+            "/StrokeStyle : 0 R",
+            "/FillStyle : 0 O",
+            "/Def ;",
+            "/Execution ;",
+            "[5 5] 1e308 d",
+            "-0.5 /Real ,",
+            "1.5 /Real ,",
+            "-2 /Real ,",
+            "; (BSLeftWidthsArray) ,",
+            "; (BSRightWidthsArray) ,",
+            "[0.5 1e308 0 0 0 0 1 0 0 1] /N X#",
+            "(DeviceGray) /CS X#",
+            "\n%\n",
+            "\n%AI5_EndPlace\n",
             "\n%%PageTrailer\n",
         ])
         .prop_map(str::to_string),
@@ -2096,8 +2171,9 @@ proptest! {
     fn ai_hostile_editing_data_never_panics(tokens in prop::collection::vec(arb_ai_token(), 0..80)) {
         use vectorcraft_testkit::ai;
         let data = ai::editing_data(200.0, 100.0, &format!("%AI5_BeginLayer\n1 1 1 1 0 0 1 0 79 128 255 0 50 0 Lb\n(L) Ln\n{}\nLB\n", tokens.join(" ")));
-        survive("hostile editing data", || Some(vectorcraft_eps::layered_ai(data.as_bytes(), Document::new(200.0, 100.0), vec![], false).0))?;
-        survive("hostile editing data, type as outlines", || Some(vectorcraft_eps::layered_ai(data.as_bytes(), Document::new(200.0, 100.0), vec![], true).0))?;
+        survive("hostile editing data", || Some(vectorcraft_eps::layered_ai(data.as_bytes(), Document::new(200.0, 100.0), vec![], false, false).0))?;
+        survive("hostile editing data, type as outlines", || Some(vectorcraft_eps::layered_ai(data.as_bytes(), Document::new(200.0, 100.0), vec![], true, false).0))?;
+        survive("hostile editing data, trusted", || Some(vectorcraft_eps::layered_ai(data.as_bytes(), Document::new(200.0, 100.0), vec![], false, true).0))?;
         let eps = ai::eps(data.as_bytes(), ai::page_ps());
         survive("hostile editing data in an EPS", || vectorcraft_engine::cmd::fileio::load("x.eps", &eps).ok().map(|l| l.doc))?;
         // An EPS whose page is its art's box, not its artboard: what prints outside it is compared too.

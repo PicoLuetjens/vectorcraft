@@ -27,6 +27,7 @@ use vectorcraft_tools::{PaintDefaults, Tool};
 pub use cmd::EyedropperOptions;
 pub use cmd::clipboard::Clipboard;
 pub use cmd::distortcmds::perspective_click;
+pub use cmd::params::{check_keys, check_params};
 pub use cmd::rasterfx::{export_pdf, flatten_raster_effects};
 pub use cmd::{CommandInfo, CommandSpec, command_specs, find_command};
 pub use journal::Journal;
@@ -217,6 +218,25 @@ pub struct Interaction {
     /// The perspective transform the previews make (`perspective.transform` params): Transform
     /// Again repeats it once the drag is committed.
     pub perspective_again: Option<Value>,
+    /// A transform with `copy` keeps the copies it made of the snapshot here ([`PreviewCopies`]).
+    pub(crate) copies: Option<Arc<PreviewCopies>>,
+}
+
+/// This holds the copies that a transform with `copy` made of an interaction's snapshot
+/// ([`cmd::object::apply_transform`]). A later transform with `copy` of the same objects, while
+/// the document is still that snapshot, starts from `doc` and transforms only the copies.
+#[derive(Debug)]
+pub(crate) struct PreviewCopies {
+    /// The copies were made from this snapshot.
+    pub(crate) from: Arc<Document>,
+    /// The transform copied these objects.
+    pub(crate) roots: Vec<NodeId>,
+    /// This is `from` with the copies added, untransformed.
+    pub(crate) doc: Arc<Document>,
+    /// This is the selection after copying, with the copies selected.
+    pub(crate) selection: Selection,
+    /// These are the copies' ids, in the order of `roots`.
+    pub(crate) ids: Vec<NodeId>,
 }
 
 /// An open undo group ([`Session::begin_undo_group`]): the edits made in it are one undo step.
@@ -1278,6 +1298,10 @@ impl Session {
     /// Execute a command by id. This is THE entry point for every frontend.
     pub fn execute(&mut self, id: &str, params: &Value) -> Result<Value> {
         let spec = find_command(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
+        // The crate's own tests are the audit of the params descriptions (#1442): a key a test
+        // passes that its command's description doesn't name fails the test.
+        #[cfg(test)]
+        cmd::params::check_params(id, params)?;
         // Clear's menu needs a selection; an agent supplying explicit targets only needs a
         // document. The command validates those targets before making any edit.
         let enabled = if id == "edit.clear" && params.get("ids").is_some() { cmd::has_doc(self) } else { (spec.enabled)(self) };
@@ -1496,6 +1520,7 @@ impl Session {
             variables_highlight: st.variables_highlight.clone(),
             isolation: st.isolation,
             perspective_again: None,
+            copies: None,
         });
         Ok(())
     }
@@ -1740,6 +1765,8 @@ mod tests_knockout;
 #[cfg(test)]
 mod tests_labspots;
 #[cfg(test)]
+mod tests_large_edits;
+#[cfg(test)]
 mod tests_layerclip;
 #[cfg(test)]
 mod tests_layers;
@@ -1787,6 +1814,8 @@ mod tests_paintproxy;
 mod tests_panelcmds;
 #[cfg(test)]
 mod tests_paragraphs;
+#[cfg(test)]
+mod tests_params;
 #[cfg(test)]
 mod tests_pathops;
 #[cfg(test)]

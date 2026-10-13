@@ -3343,6 +3343,8 @@
 	Split Complementary	Felosztott kiegészítő
 	Split Freeform Line	Szabad formájú vonal kettévágása
 	Split Into Grid	Felosztás rácsra
+	Total:	Összesen:
+	Add Guides	Segédvonalak hozzáadása
 	Split Into Grid…	Felosztás rácsra…
 	Split Path	Útvonal kettévágása
 	spot	direkt
@@ -4027,7 +4029,7 @@ theme	Appearance	Kinézet
 @msg	already editing a pattern	már folyik egy mintázat szerkesztése
 @msg	an image VectorCraft can't read was left out	kimaradt egy kép, amelyet a VectorCraft nem tud olvasni
 @msg	an image whose data is cut short was left out	kimaradt egy csonka adatú kép
-@msg	linked pictures show the low-resolution preview saved in the file until their files are found: relink them in the Links panel	a csatolt képek a fájlban mentett kis felbontású előnézetet mutatják, amíg a fájljaik elő nem kerülnek: csatolja őket újra a Csatolások panelen
+@msg	linked pictures show the low-resolution preview saved in the file until their files are found: relink them in the Links panel	a csatolt képek a fájlban mentett kis felbontású előnézetet mutatják, amíg a fájljaik elő nem kerülnek: csatold őket újra a Csatolások panelen
 @msg	area type in frames too short for a line of the font it shows in got taller frames ({_1}): their type wouldn't show otherwise	a túl alacsony keretben lévő területszöveg, amelybe a megjelenítő betűtípus egy sora sem fér el, magasabb keretet kapott ({_1}): különben nem látszana
 @msg	an object can't be read	egy objektum nem olvasható
 @msg	an object in perspective would leave the edited grid	egy perspektivikus objektum kikerülne a szerkesztett rácsból
@@ -4441,6 +4443,7 @@ theme	Appearance	Kinézet
 @msg	the art has no bounds	a grafikának nincsenek határai
 @msg	the art is too light for any dots	a grafika túl világos, egyetlen raszterpont sem keletkezik
 @msg	the art on them differs from the page's in {_1}% of it	a rajtuk lévő grafika az oldalétól ennyiben tér el: {_1}%
+@msg	the art on them differs from the page's in {_1}% of it: they come from its editing data all the same	a rajtuk lévő grafika az oldalétól ennyiben tér el: {_1}%; ennek ellenére a szerkesztési adataiból származnak
 @msg	the artboard to fit must be a positive size up to {_1} pt	az illesztendő rajztábla mérete pozitív, legfeljebb {_1} pt lehet
 @msg	the background worker stopped	a háttérfolyamat leállt
 @msg	the compressed file unpacks to more than {_1} MB	a tömörített fájl kicsomagolva nagyobb lenne, mint {_1} MB
@@ -4603,3 +4606,48 @@ theme	Appearance	Kinézet
 	Use Outside Rectangle As Frame	Külső téglalap használata keretként
 	Create Compound Path From Ellipses	Összetett útvonal létrehozása az ellipszisekből
 	Fill Grid	Rács kitöltése
+	Select two or more objects, or a group	Jelöljön ki két vagy több objektumot, vagy egy csoportot
+# 3D and Materials › Extrude & Bevel, Inflate and Rotate: options, Position presets and bevel shapes.
+	Back	Hátulról
+	Both sides	Mindkét oldal
+	Classic	Klasszikus
+	Cove	Homorú
+	Depth	Mélység
+	Front	Elölről
+	Isometric Bottom	Izometrikus alsó
+	Isometric Left	Izometrikus bal
+	Isometric Right	Izometrikus jobb
+	Isometric Top	Izometrikus felső
+	Off-Axis Back	Ferdén hátulról
+	Off-Axis Bottom	Ferdén alulról
+	Off-Axis Front	Ferdén elölről
+	Off-Axis Left	Ferdén balról
+	Off-Axis Right	Ferdén jobbról
+	Off-Axis Top	Ferdén felülről
+	Ogee	S-ív
+	Reset all 3D settings to their defaults.	Az összes 3D-beállítás visszaállítása az alapértékekre.
+	Step	Lépcső
+	Taper	Elvékonyodás
+	Twist	Csavarás
+	Volume	Térfogat
+3d	Cap	Zárólap
+3d	Solid	Tömör
+3d	Hollow	Üreges
+3d	Bevel	Élletörés
+3d	Rounded	Lekerekített
+3d	Space	Köz
+	Bevel Shape	Élletörés alakja
+	Bevel Inside	Élletörés befelé
+	Bevel both sides	Élletörés mindkét oldalon
+	Presets	Készletek
+@msg	An object takes one 3D effect. Edit the existing effect's options, or remove it first.	Egy objektumnak csak egy 3D effektusa lehet. Szerkessze a meglévő effektus beállításait, vagy előbb távolítsa el.
+@msg	{label} currently requires a path or compound path. Convert type, images and groups to paths first.	{label} egyelőre görbét vagy összetett görbét igényel. Előbb alakítsa görbévé a szöveget, a képeket és a csoportokat.
+@msg	{label} requires a shape with at least two anchors	{label} legalább két szerkesztőpontos alakzatot igényel
+@msg	The shape is too complex for a 3D effect	Az alakzat túl összetett a 3D effektushoz
+@msg	The 3D surface is too complex; simplify the shape	A 3D felület túl összetett; egyszerűsítse az alakzatot
+	Transform Objects	Objektumok transzformálása
+@msg	unknown parameter `{key}`; did you mean `{near}`?	ismeretlen paraméter: `{key}`; erre gondolt: `{near}`?
+@msg	unknown parameter `{key}`; the command takes no parameters	ismeretlen paraméter: `{key}`; a parancsnak nincs paramétere
+@msg	unknown parameter `{key}`; the command takes: {keys}	ismeretlen paraméter: `{key}`; a parancs ezeket fogadja el: {keys}
+	Load EPS into Clipboard	EPS betöltése a vágólapra
+@msg	an image of {w} × {h} pixels is too large to draw	egy {w} × {h} pixeles kép túl nagy a kirajzoláshoz
